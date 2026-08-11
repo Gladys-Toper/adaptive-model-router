@@ -1,0 +1,23 @@
+{
+  "allowed_modes": [
+    "explicit_checkpoint_restart"
+  ],
+  "checkpoint_contract_name": "adaptive-workflow.resume-checkpoint",
+  "checkpoint_contract_version": 1,
+  "claim_contract_name": "adaptive-workflow.resume-claim",
+  "claim_contract_version": 1,
+  "max_checkpoint_bytes": 65536,
+  "max_checkpoint_summary_bytes": 4096,
+  "max_checkpoint_ttl_seconds": 86400,
+  "max_continuations": 2,
+  "max_work_items": 256,
+  "policy_name": "adaptive-workflow.resumption-policy",
+  "policy_sha256": "96b972a4ec02fffeb715d92023310b269a7d2dccaaf92d1e942bbc4e05e0b4fb",
+  "policy_version": 1,
+  "safe_mutation_classes": [
+    "none"
+  ],
+  "schema_version": 1,
+  "work_manifest_contract_name": "adaptive-workflow.resume-work-manifest",
+  "work_manifest_contract_version": 1
+}

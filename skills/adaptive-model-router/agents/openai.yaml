@@ -1,0 +1,7 @@
+interface:
+  display_name: "Adaptive Model Router"
+  short_description: "Continuously optimize model routing by evidence"
+  default_prompt: "Use $adaptive-model-router to route this task with the active policy and evaluate any newly available coding-model challengers."
+
+policy:
+  allow_implicit_invocation: true

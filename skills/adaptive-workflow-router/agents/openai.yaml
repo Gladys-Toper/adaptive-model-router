@@ -1,0 +1,7 @@
+interface:
+  display_name: "Adaptive Workflow Router"
+  short_description: "Route work through evidence-gated application workflows"
+  default_prompt: "Use $adaptive-workflow-router to compose this task from application workflows and resolve every cognitive phase through the active adaptive model policy."
+
+policy:
+  allow_implicit_invocation: true

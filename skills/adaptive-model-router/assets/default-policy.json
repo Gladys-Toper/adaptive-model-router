@@ -1,0 +1,103 @@
+{
+  "schema_version": 1,
+  "revision": 1,
+  "updated_at": "2026-07-09T00:00:00Z",
+  "source": "user-approved-baseline-2026-07-09",
+  "tiers": {
+    "T0": {
+      "mode": "deterministic"
+    },
+    "T1": {
+      "agent": "fast_operator",
+      "profile_file": "fast-operator.toml",
+      "model": "gpt-5.6-luna",
+      "effort": "low",
+      "fallbacks": [
+        {"model": "gpt-5.6-terra", "effort": "low"},
+        {"model": "gpt-5.6-sol", "effort": "low"}
+      ]
+    },
+    "T2": {
+      "agent": "standard_worker",
+      "profile_file": "standard-worker.toml",
+      "model": "gpt-5.6-terra",
+      "effort": "medium",
+      "fallbacks": [
+        {"model": "gpt-5.6-sol", "effort": "medium"},
+        {"model": "gpt-5.6-luna", "effort": "medium"}
+      ]
+    },
+    "T3": {
+      "agent": "high_solver",
+      "profile_file": "high-solver.toml",
+      "model": "gpt-5.6-terra",
+      "effort": "high",
+      "fallbacks": [
+        {"model": "gpt-5.6-sol", "effort": "high"},
+        {"model": "gpt-5.6-luna", "effort": "high"}
+      ]
+    },
+    "T4": {
+      "agent": "ultra_planner",
+      "profile_file": "ultra-planner.toml",
+      "model": "gpt-5.6-sol",
+      "effort": "ultra",
+      "fallbacks": []
+    }
+  },
+  "constraints": {
+    "allowed_provider": "openai",
+    "allowed_service_tiers": ["default"],
+    "default_service_tier": "default",
+    "forbidden_model_patterns": ["anthropic", "claude"],
+    "model_version_window": {"max_version_lag": 0},
+    "evaluation_requires_latest_family": true,
+    "required_active_variants": {"T4": "sol"},
+    "current_family_variant_preferences": {
+      "T1": ["luna", "terra", "sol"],
+      "T2": ["terra", "sol", "luna"],
+      "T3": ["terra", "sol", "luna"],
+      "T4": ["sol", "terra", "luna"]
+    },
+    "require_local_catalog_availability": true,
+    "require_enforced_model_identity_for_evals": true,
+    "execution_evidence_mode": "server-metadata",
+    "server_metadata_runner_path": null,
+    "server_metadata_runner_sha256": null,
+    "attestation_verifier_path": null,
+    "attestation_verifier_sha256": null
+  },
+  "promotion": {
+    "min_pairs_by_tier": {"T1": 12, "T2": 12, "T3": 16, "T4": 16},
+    "min_holdout_pairs": 4,
+    "min_task_families": 3,
+    "max_quality_drop": 0.02,
+    "min_quality_gain": 0.05,
+    "min_efficiency_gain": 0.10,
+    "max_efficiency_regression": 0.15,
+    "max_extra_failures_by_tier": {"T1": 1, "T2": 1, "T3": 0, "T4": 0},
+    "top_tier_baseline": {
+      "reference_tier": "T4",
+      "required_tiers": ["T1", "T2", "T3"],
+      "min_pairs": 5,
+      "min_holdout_pairs": 1,
+      "min_task_families": 3,
+      "max_quality_drop": 0.02,
+      "max_extra_failures_by_tier": {"T1": 1, "T2": 1, "T3": 0},
+      "min_median_token_gain": 0.10,
+      "min_median_latency_gain": 0.10,
+      "min_positive_token_cases": 4,
+      "min_positive_latency_cases": 4,
+      "max_age_days": 14
+    },
+    "require_zero_candidate_critical_failures": true,
+    "auto_promote_qualified": true,
+    "snapshot_retention": 5
+  },
+  "canary": {
+    "window_pairs": 10,
+    "consecutive_bad_windows": 2,
+    "max_quality_drop": 0.03,
+    "max_efficiency_regression": 0.25
+  }
+}
