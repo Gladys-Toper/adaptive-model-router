@@ -1,0 +1,42 @@
+{
+  "schema_version": 1,
+  "policy_name": "adaptive-workflow.execution-budget-policy",
+  "policy_version": 1,
+  "accepted_history": {
+    "minimum_samples": 5,
+    "percentile": 0.9,
+    "headroom": 1.15,
+    "max_sample_age_seconds": 7776000,
+    "group_by": [
+      "workflow_id",
+      "workflow_version",
+      "phase_id",
+      "model",
+      "effort",
+      "tool_mode"
+    ]
+  },
+  "model_resource_weights": {
+    "gpt-5.6-luna": {
+      "cost_weight": 0.5,
+      "quota_weight": 0.75
+    },
+    "gpt-5.6-terra": {
+      "cost_weight": 1.0,
+      "quota_weight": 1.0
+    },
+    "gpt-5.6-sol": {
+      "cost_weight": 2.0,
+      "quota_weight": 1.5
+    }
+  },
+  "unknown_model_resource_weights": {
+    "cost_weight": 1.5,
+    "quota_weight": 1.5
+  },
+  "increase_contract": {
+    "contract_name": "adaptive-workflow.execution-budget-increase",
+    "contract_version": 1,
+    "review_workflow_id": "review.audit"
+  }
+}

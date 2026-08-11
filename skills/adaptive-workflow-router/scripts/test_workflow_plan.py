@@ -255,6 +255,13 @@ def test_release_dry_run_is_read_only_even_when_routed_to_t4() -> None:
             "tool_mode": "none",
             "mutation_authorized": False,
             "wall_time_seconds": 60,
+            "requested_budget_limits": {
+                "token_cap": None,
+                "model_cycle_cap": None,
+                "tool_cycle_cap": None,
+            },
+            "token_cap_contract_sha256": None,
+            "budget_increase_contract_sha256": None,
         }
 
 
@@ -360,8 +367,12 @@ def test_dispatch_packet_binds_exact_phase_and_runtime_inputs() -> None:
             "phase_contract_sha256",
             "prompt_sha256",
             "context_files",
+            "context_bundle",
             "cwd",
             "runtime_contract",
+            "required_skills",
+            "skill_hashes",
+            "source_commit",
             "dispatch_packet_sha256",
         }
         phase_identity = {
@@ -379,6 +390,9 @@ def test_dispatch_packet_binds_exact_phase_and_runtime_inputs() -> None:
             phase_identity
         )
         assert packet["prompt_sha256"] == hashlib.sha256(prompt_raw).hexdigest()
+        assert packet["required_skills"] == []
+        assert packet["skill_hashes"] == {}
+        assert len(packet["source_commit"]) == 40
         assert packet["context_files"] == [
             {
                 "path": str(context_two.resolve()),
@@ -391,6 +405,9 @@ def test_dispatch_packet_binds_exact_phase_and_runtime_inputs() -> None:
                 "bytes": len(context_one_raw),
             },
         ]
+        assert packet["context_bundle"] == WORKFLOW_PLAN.context_bundle_record(
+            packet["context_files"]
+        )
         assert packet["cwd"] == str(cwd.resolve())
         assert packet["runtime_contract"] == {
             "sandbox": "read-only",
@@ -398,6 +415,13 @@ def test_dispatch_packet_binds_exact_phase_and_runtime_inputs() -> None:
             "tool_mode": "none",
             "mutation_authorized": False,
             "wall_time_seconds": 73,
+            "requested_budget_limits": {
+                "token_cap": None,
+                "model_cycle_cap": None,
+                "tool_cycle_cap": None,
+            },
+            "token_cap_contract_sha256": None,
+            "budget_increase_contract_sha256": None,
         }
         packet_identity = dict(packet)
         packet_sha256 = packet_identity.pop("dispatch_packet_sha256")

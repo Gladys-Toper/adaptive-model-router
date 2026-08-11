@@ -25,11 +25,14 @@ import uuid
 from pathlib import Path
 from typing import Any, Callable
 
+import agent_governance as governance
+
 
 SKILL_DIR = Path(__file__).resolve().parent.parent
 PLANNER = SKILL_DIR / "scripts" / "workflow_plan.py"
 WORKFLOW_CATALOG = SKILL_DIR / "assets" / "workflows.json"
 RESUMPTION_POLICY = SKILL_DIR / "assets" / "resumption-policy.json"
+EXECUTION_BUDGET_POLICY = SKILL_DIR / "assets" / "execution-budget-policy.json"
 CODEX_HOME = Path(os.environ.get("CODEX_HOME", "~/.codex")).expanduser().resolve()
 MODEL_SKILL = CODEX_HOME / "skills" / "adaptive-model-router"
 ROUTER = MODEL_SKILL / "scripts" / "router_lab.py"
@@ -85,6 +88,10 @@ PLAN_RESOLUTION_FIELDS = (
 HEX_SHA256 = re.compile(r"[0-9a-f]{64}")
 WORK_ID = re.compile(r"[a-z0-9][a-z0-9._-]{0,63}")
 TOKEN_CAP_CONTRACT_NAME = "adaptive-workflow.fixed-token-cap"
+BUDGET_INCREASE_CONTRACT_NAME = "adaptive-workflow.execution-budget-increase"
+BUDGET_INCREASE_REVIEW_PROPOSAL_NAME = (
+    "adaptive-workflow.execution-budget-increase-review"
+)
 CHECKPOINT_PREFIX = "ADAPTIVE_WORKFLOW_CHECKPOINT\n"
 RESUME_AUTHORITY_NAME = "adaptive-workflow.resumption-authority"
 RESUME_WORK_MANIFEST_NAME = "adaptive-workflow.resume-work-manifest"
@@ -139,6 +146,107 @@ class AppServerDeadline(DispatchError):
     """A bounded App Server read deadline elapsed without a protocol event."""
 
 
+def source_commit_for(cwd: Path) -> str:
+    """Bind receipts to the checked-out source without letting callers assert it."""
+    try:
+        completed = subprocess.run(
+            ["git", "-C", str(cwd), "rev-parse", "HEAD"],
+            text=True,
+            capture_output=True,
+            timeout=10,
+            check=False,
+        )
+        value = completed.stdout.strip().lower()
+        if len(value) in {40, 64} and HEX_SHA256.fullmatch(value + "0" * (64 - len(value))):
+            return value
+    except (OSError, subprocess.SubprocessError):
+        pass
+    # Isolated protocol tests do not necessarily have a Git worktree.  A live
+    # caller can make this explicit, while the receipt still says it is unknown.
+    return os.environ.get("ADAPTIVE_WORKFLOW_SOURCE_COMMIT", "0" * 40)
+
+
+def _skill_requirements_from_packet(packet: dict[str, Any] | None, cwd: Path) -> dict[str, Any]:
+    if packet is None:
+        return {
+            "required_skills": [],
+            "skill_hashes": {},
+            "source_commit": source_commit_for(cwd),
+        }
+    required = packet.get("required_skills", [])
+    hashes = packet.get("skill_hashes", {})
+    source_commit = packet.get("source_commit", source_commit_for(cwd))
+    if (
+        not isinstance(required, list)
+        or not isinstance(hashes, dict)
+        or not isinstance(source_commit, str)
+        or len(source_commit) not in {40, 64}
+    ):
+        raise DispatchError("planner dispatch packet has invalid skill requirements")
+    expected_hashes = {
+        item.get("name"): item.get("skill_sha256")
+        for item in required
+        if isinstance(item, dict) and isinstance(item.get("name"), str)
+    }
+    if hashes != expected_hashes:
+        raise DispatchError("planner dispatch packet skill hashes do not match requirements")
+    return {
+        "required_skills": required,
+        "skill_hashes": hashes,
+        "source_commit": source_commit,
+        **{
+            key: packet[key]
+            for key in (
+                "required_skills_contract_path",
+                "required_skills_contract_sha256",
+            )
+            if key in packet
+        },
+    }
+
+
+def _files_changed(cwd: Path) -> list[str]:
+    try:
+        completed = subprocess.run(
+            ["git", "-C", str(cwd), "status", "--porcelain=v1"],
+            text=True,
+            capture_output=True,
+            timeout=10,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return []
+    if getattr(completed, "returncode", 0) != 0:
+        return []
+    names: set[str] = set()
+    for line in completed.stdout.splitlines():
+        if len(line) >= 4:
+            names.add(line[3:].split(" -> ")[-1])
+    return sorted(names)
+
+
+def workflow_receipt_fields(
+    args: argparse.Namespace, *, status: str, issues: list[str]
+) -> dict[str, Any]:
+    bound = getattr(args, "_skill_requirements", None)
+    if not isinstance(bound, dict):
+        bound = _skill_requirements_from_packet(None, args.cwd)
+    phase = getattr(args, "_planned_phase", None)
+    exit_gate = phase.get("exit_gate", []) if isinstance(phase, dict) else []
+    return {
+        "required_skills": bound["required_skills"],
+        "skill_hashes": bound["skill_hashes"],
+        "source_commit": bound["source_commit"],
+        "exit_gate": exit_gate,
+        "files_changed": _files_changed(args.cwd),
+        "verification": {
+            "dispatcher_acceptance": status == "COMPLETED",
+            "runtime_identity_verified": status == "COMPLETED" and not issues,
+            "issues": list(issues),
+        },
+    }
+
+
 class DispatchArgumentParser(argparse.ArgumentParser):
     def error(self, message: str) -> None:
         raise DispatchUsageError(message)
@@ -154,6 +262,206 @@ def canonical_json(value: Any) -> str:
 
 def content_hash(value: Any) -> str:
     return sha256_bytes(canonical_json(value).encode("utf-8"))
+
+
+def context_bundle_record(
+    context_records: list[dict[str, Any]], *, mode: str
+) -> dict[str, Any]:
+    """Bind one ordered immutable context bundle instead of rediscovering context."""
+    if mode not in {"precomputed-planner-packet", "direct-hashed"}:
+        raise DispatchError("context bundle mode is invalid")
+    identity = {
+        "schema_version": 1,
+        "mode": mode,
+        "files": context_records,
+        "total_bytes": sum(record["bytes"] for record in context_records),
+    }
+    return {**identity, "bundle_sha256": content_hash(identity)}
+
+
+def _nearest_rank(values: list[int], percentile: float) -> int:
+    if not values:
+        raise DispatchError("cannot calculate a budget percentile without samples")
+    ordered = sorted(values)
+    return ordered[max(0, math.ceil(percentile * len(ordered)) - 1)]
+
+
+def load_execution_budget_policy() -> dict[str, Any]:
+    policy = read_json(
+        EXECUTION_BUDGET_POLICY.resolve(), "execution budget policy"
+    )
+    history = policy.get("accepted_history")
+    weights = policy.get("model_resource_weights")
+    unknown = policy.get("unknown_model_resource_weights")
+    increase = policy.get("increase_contract")
+    if (
+        policy.get("schema_version") != 1
+        or policy.get("policy_name")
+        != "adaptive-workflow.execution-budget-policy"
+        or policy.get("policy_version") != 1
+        or not isinstance(history, dict)
+        or type(history.get("minimum_samples")) is not int
+        or history["minimum_samples"] < 1
+        or not isinstance(history.get("percentile"), (int, float))
+        or not 0 < history["percentile"] <= 1
+        or not isinstance(history.get("headroom"), (int, float))
+        or history["headroom"] < 1
+        or type(history.get("max_sample_age_seconds")) is not int
+        or history["max_sample_age_seconds"] < 1
+        or history.get("group_by")
+        != [
+            "workflow_id",
+            "workflow_version",
+            "phase_id",
+            "model",
+            "effort",
+            "tool_mode",
+        ]
+        or not isinstance(weights, dict)
+        or not isinstance(unknown, dict)
+        or not isinstance(increase, dict)
+        or increase.get("contract_name") != BUDGET_INCREASE_CONTRACT_NAME
+        or increase.get("contract_version") != 1
+        or increase.get("review_workflow_id") != "review.audit"
+    ):
+        raise DispatchError("execution budget policy has an invalid schema")
+    for record in [*weights.values(), unknown]:
+        if (
+            not isinstance(record, dict)
+            or not isinstance(record.get("cost_weight"), (int, float))
+            or not isinstance(record.get("quota_weight"), (int, float))
+            or record["cost_weight"] <= 0
+            or record["quota_weight"] <= 0
+        ):
+            raise DispatchError("execution budget model weights are invalid")
+    return policy
+
+
+def accepted_usage_samples(
+    request: dict[str, Any],
+    resolution: dict[str, Any],
+    tool_mode: str,
+    *,
+    registry_path: Path | None = None,
+    now_epoch: float | None = None,
+) -> list[dict[str, Any]]:
+    """Read only dispatcher-accepted, hash-chained usage for the exact route group."""
+    policy = load_execution_budget_policy()
+    path = registry_path or EXECUTION_REGISTRY
+    if not path.exists():
+        return []
+    if path.is_symlink() or not path.is_file():
+        raise DispatchError("execution registry is missing or unsafe")
+    receipts = _decode_receipt_registry(path.read_bytes())
+    cutoff = (now_epoch or time.time()) - policy["accepted_history"][
+        "max_sample_age_seconds"
+    ]
+    expected = {
+        "workflow_id": request.get("workflow_id"),
+        "workflow_version": request.get("workflow_version"),
+        "phase_id": request.get("phase_id"),
+        "model": resolution.get("model"),
+        "effort": resolution.get("effort"),
+        "tool_mode": tool_mode,
+    }
+    samples: list[dict[str, Any]] = []
+    for receipt in receipts:
+        usage = receipt.get("accepted_usage")
+        if (
+            receipt.get("receipt_type") != "execution"
+            or receipt.get("status") != "COMPLETED"
+            or not isinstance(receipt.get("issued_at_epoch"), (int, float))
+            or receipt["issued_at_epoch"] < cutoff
+            or not isinstance(usage, dict)
+            or any(usage.get(field) != value for field, value in expected.items())
+        ):
+            continue
+        measured = {
+            "total_tokens": usage.get("total_tokens"),
+            "model_cycles": usage.get("model_cycles"),
+            "tool_cycles": usage.get("tool_cycles"),
+            "duration_ms": usage.get("duration_ms"),
+        }
+        if all(type(value) is int and value >= 0 for value in measured.values()):
+            samples.append(measured)
+    return samples
+
+
+def apply_measured_success_envelope(
+    base: dict[str, Any],
+    request: dict[str, Any],
+    resolution: dict[str, Any],
+    tool_mode: str,
+    *,
+    registry_path: Path | None = None,
+) -> dict[str, Any]:
+    """Tighten cold-start limits from successful route-specific distributions."""
+    policy = load_execution_budget_policy()
+    samples = accepted_usage_samples(
+        request, resolution, tool_mode, registry_path=registry_path
+    )
+    history = policy["accepted_history"]
+    resource = policy["model_resource_weights"].get(
+        resolution.get("model"), policy["unknown_model_resource_weights"]
+    )
+    weight = max(1.0, resource["cost_weight"], resource["quota_weight"])
+    result = {
+        **base,
+        "accepted_history": {
+            "sample_count": len(samples),
+            "minimum_samples": history["minimum_samples"],
+            "group": {
+                "workflow_id": request.get("workflow_id"),
+                "workflow_version": request.get("workflow_version"),
+                "phase_id": request.get("phase_id"),
+                "model": resolution.get("model"),
+                "effort": resolution.get("effort"),
+                "tool_mode": tool_mode,
+            },
+            "resource_weights": resource,
+            "status": "cold-start",
+        },
+    }
+    if len(samples) < history["minimum_samples"]:
+        return result
+    percentile = float(history["percentile"])
+    # Higher-cost or scarcer models receive less discretionary headroom, but a
+    # successful measured percentile is never cut below its observed value.
+    weighted_headroom = 1.0 + (float(history["headroom"]) - 1.0) / weight
+    observed = {
+        field: _nearest_rank([sample[field] for sample in samples], percentile)
+        for field in ("total_tokens", "model_cycles", "tool_cycles", "duration_ms")
+    }
+    measured_token_cap = math.ceil(observed["total_tokens"] * weighted_headroom)
+    measured_model_cap = max(
+        1, math.ceil(observed["model_cycles"] * weighted_headroom)
+    )
+    measured_tool_cap = (
+        0
+        if tool_mode == "none"
+        else max(1, math.ceil(observed["tool_cycles"] * weighted_headroom))
+    )
+    measured_wall_cap = max(
+        1, math.ceil(observed["duration_ms"] * weighted_headroom / 1000)
+    )
+    result.update(
+        {
+            "mode": "measured-success-envelope",
+            "token_cap": measured_token_cap,
+            "model_cycle_cap": measured_model_cap,
+            "tool_cycle_cap": measured_tool_cap,
+            "recommended_wall_time_seconds": measured_wall_cap,
+            "accepted_history": {
+                **result["accepted_history"],
+                "status": "measured",
+                "percentile": percentile,
+                "headroom": history["headroom"],
+                "weighted_headroom": weighted_headroom,
+                "observed_percentile": observed,
+            },
+        }
+    )
+    return result
 
 
 def read_json(path: Path, label: str) -> dict[str, Any]:
@@ -190,6 +498,21 @@ def _fsync_file(path: Path) -> None:
         os.fsync(descriptor)
     finally:
         os.close(descriptor)
+
+
+def allocate_run_directory(run_root: Path, canonical_name: str, *, mode: int) -> Path:
+    """Atomically claim a new run directory without reusing an existing run."""
+    run_root.mkdir(parents=True, exist_ok=True)
+    suffix = 0
+    while True:
+        name = canonical_name if suffix == 0 else f"{canonical_name}-{suffix:04d}"
+        candidate = run_root / name
+        try:
+            candidate.mkdir(mode=mode)
+        except FileExistsError:
+            suffix += 1
+            continue
+        return candidate
 
 
 def _atomic_private_bytes(path: Path, value: bytes) -> None:
@@ -740,6 +1063,17 @@ def expected_dispatch_packet(
     resume_contract = build_expected_resume_contract(
         args, plan_binding.get("phase", {})
     )
+    requirements = getattr(args, "_skill_requirements", None)
+    if not isinstance(requirements, dict):
+        requirements = _skill_requirements_from_packet(None, cwd)
+    def optional_hash(value: Path | None) -> str | None:
+        if value is None:
+            return None
+        unresolved = value.expanduser().absolute()
+        if unresolved.is_symlink() or not unresolved.is_file():
+            raise DispatchError("dispatch budget contract is missing or unsafe")
+        return sha256_bytes(unresolved.resolve(strict=True).read_bytes())
+
     identity = {
         "schema_version": 2 if resume_contract is not None else 1,
         "planner_contract_version": plan_binding.get("planner_contract_version"),
@@ -751,6 +1085,9 @@ def expected_dispatch_packet(
         ),
         "prompt_sha256": prompt_sha256,
         "context_files": context_records,
+        "context_bundle": context_bundle_record(
+            context_records, mode="precomputed-planner-packet"
+        ),
         "cwd": str(cwd),
         "runtime_contract": {
             "sandbox": args.sandbox,
@@ -758,6 +1095,28 @@ def expected_dispatch_packet(
             "tool_mode": args.tool_mode,
             "mutation_authorized": args.mutation_authorized,
             "wall_time_seconds": args.wall_time_seconds,
+            "requested_budget_limits": {
+                "token_cap": getattr(args, "token_cap", None),
+                "model_cycle_cap": getattr(args, "model_cycle_cap", None),
+                "tool_cycle_cap": getattr(args, "tool_cycle_cap", None),
+            },
+            "token_cap_contract_sha256": optional_hash(
+                getattr(args, "token_cap_contract", None)
+            ),
+            "budget_increase_contract_sha256": optional_hash(
+                getattr(args, "budget_increase_contract", None)
+            ),
+        },
+        "required_skills": requirements["required_skills"],
+        "skill_hashes": requirements["skill_hashes"],
+        "source_commit": requirements["source_commit"],
+        **{
+            key: requirements[key]
+            for key in (
+                "required_skills_contract_path",
+                "required_skills_contract_sha256",
+            )
+            if key in requirements
         },
     }
     if resume_contract is not None:
@@ -1598,6 +1957,174 @@ def validate_explicit_token_cap(
     }
 
 
+def budget_increase_review_proposal(
+    *,
+    task_binding_sha256: str,
+    measured_limits: dict[str, int],
+    requested_limits: dict[str, int],
+    evidence_sha256: str,
+    rationale: str,
+) -> dict[str, Any]:
+    identity = {
+        "schema_version": 1,
+        "proposal_name": BUDGET_INCREASE_REVIEW_PROPOSAL_NAME,
+        "task_binding_sha256": task_binding_sha256,
+        "measured_limits": measured_limits,
+        "requested_limits": requested_limits,
+        "evidence_sha256": evidence_sha256,
+        "rationale": rationale.strip(),
+    }
+    return {**identity, "proposal_sha256": content_hash(identity)}
+
+
+def validate_budget_increase_contract(
+    contract_path: Path,
+    *,
+    task_binding: dict[str, Any],
+    measured_limits: dict[str, int],
+    requested_limits: dict[str, int],
+    registry_path: Path | None = None,
+) -> dict[str, Any]:
+    """Require a trusted independent review before enlarging a measured envelope."""
+    unresolved = contract_path.expanduser().absolute()
+    if unresolved.is_symlink() or not unresolved.is_file():
+        raise DispatchError("budget increase contract is missing or unsafe")
+    path = unresolved.resolve(strict=True)
+    contract = read_json(path, "budget increase contract")
+    fields = {
+        "schema_version",
+        "contract_name",
+        "contract_version",
+        "task_binding_sha256",
+        "measured_limits",
+        "requested_limits",
+        "review_execution_receipt_id",
+        "review_proposal_sha256",
+        "evidence_path",
+        "evidence_sha256",
+        "rationale",
+        "contract_sha256",
+    }
+    if (
+        set(contract) != fields
+        or contract.get("schema_version") != 1
+        or contract.get("contract_name") != BUDGET_INCREASE_CONTRACT_NAME
+        or contract.get("contract_version") != 1
+        or contract.get("task_binding_sha256") != content_hash(task_binding)
+        or contract.get("measured_limits") != measured_limits
+        or contract.get("requested_limits") != requested_limits
+        or not isinstance(contract.get("review_execution_receipt_id"), str)
+        or not isinstance(contract.get("review_proposal_sha256"), str)
+        or not HEX_SHA256.fullmatch(contract["review_proposal_sha256"])
+        or not isinstance(contract.get("rationale"), str)
+        or not contract["rationale"].strip()
+    ):
+        raise DispatchError("budget increase contract has an invalid task binding")
+    if not any(
+        requested_limits[field] > measured_limits[field]
+        for field in measured_limits
+    ):
+        raise DispatchError("budget increase contract does not increase any limit")
+    evidence_value = contract.get("evidence_path")
+    evidence_hash = contract.get("evidence_sha256")
+    if (
+        not isinstance(evidence_value, str)
+        or not isinstance(evidence_hash, str)
+        or not HEX_SHA256.fullmatch(evidence_hash)
+    ):
+        raise DispatchError("budget increase contract omitted measured evidence")
+    evidence_path = Path(evidence_value).expanduser()
+    if (
+        not evidence_path.is_absolute()
+        or evidence_path.is_symlink()
+        or not evidence_path.is_file()
+        or sha256_bytes(evidence_path.read_bytes()) != evidence_hash
+    ):
+        raise DispatchError("budget increase evidence is missing or changed")
+    review_proposal = budget_increase_review_proposal(
+        task_binding_sha256=contract["task_binding_sha256"],
+        measured_limits=measured_limits,
+        requested_limits=requested_limits,
+        evidence_sha256=evidence_hash,
+        rationale=contract["rationale"],
+    )
+    if contract["review_proposal_sha256"] != review_proposal["proposal_sha256"]:
+        raise DispatchError("budget increase review proposal binding is invalid")
+    registry = registry_path or EXECUTION_REGISTRY
+    if registry.is_symlink() or not registry.is_file():
+        raise DispatchError("budget increase review registry is missing or unsafe")
+    review_id = contract["review_execution_receipt_id"]
+    review = next(
+        (
+            receipt
+            for receipt in _decode_receipt_registry(registry.read_bytes())
+            if receipt.get("receipt_id") == review_id
+        ),
+        None,
+    )
+    if (
+        not isinstance(review, dict)
+        or review.get("receipt_type") != "execution"
+        or review.get("status") != "COMPLETED"
+        or review.get("accepted_usage", {}).get("workflow_id") != "review.audit"
+    ):
+        raise DispatchError(
+            "budget increase requires a trusted completed review.audit receipt"
+        )
+    review_metadata_value = review.get("metadata_path")
+    review_metadata_hash = review.get("metadata_sha256")
+    if (
+        not isinstance(review_metadata_value, str)
+        or not isinstance(review_metadata_hash, str)
+        or not HEX_SHA256.fullmatch(review_metadata_hash)
+    ):
+        raise DispatchError("budget increase review receipt omitted bound metadata")
+    review_metadata_path = Path(review_metadata_value).expanduser()
+    if (
+        not review_metadata_path.is_absolute()
+        or review_metadata_path.is_symlink()
+        or not review_metadata_path.is_file()
+        or sha256_bytes(review_metadata_path.read_bytes()) != review_metadata_hash
+    ):
+        raise DispatchError("budget increase review metadata is missing or changed")
+    review_metadata = read_json(
+        review_metadata_path.resolve(strict=True), "budget increase review metadata"
+    )
+    review_server = review_metadata.get("server")
+    review_output = (
+        review_server.get("output_text")
+        if isinstance(review_server, dict)
+        else None
+    )
+    expected_review_output = (
+        f"APPROVE {BUDGET_INCREASE_CONTRACT_NAME} "
+        f"{review_proposal['proposal_sha256']}"
+    )
+    if (
+        review_metadata.get("status") != "COMPLETED"
+        or review_output != expected_review_output
+        or review.get("final_output_sha256")
+        != sha256_bytes(expected_review_output.encode("utf-8"))
+    ):
+        raise DispatchError(
+            "review.audit receipt does not approve this exact budget increase proposal"
+        )
+    identity = {key: contract[key] for key in fields if key != "contract_sha256"}
+    if contract.get("contract_sha256") != content_hash(identity):
+        raise DispatchError("budget increase contract self-hash is invalid")
+    return {
+        "path": str(path),
+        "file_sha256": sha256_bytes(path.read_bytes()),
+        "contract_sha256": contract["contract_sha256"],
+        "review_execution_receipt_id": review_id,
+        "review_execution_receipt_sha256": review["receipt_sha256"],
+        "review_proposal_sha256": review_proposal["proposal_sha256"],
+        "evidence_path": str(evidence_path.resolve()),
+        "evidence_sha256": evidence_hash,
+        "rationale": contract["rationale"].strip(),
+    }
+
+
 def derived_token_budget(
     request: dict[str, Any],
     resolution: dict[str, Any],
@@ -1632,28 +2159,33 @@ def derived_token_budget(
             "tool_mode": tool_mode,
         }
     else:
+        # Tool-enabled turns replay their accumulated context.  Budgeting eight
+        # to ten full turns made a small T2 patch eligible to consume hundreds
+        # of thousands of input tokens.  The dispatcher now funds a short,
+        # evidence-first loop; callers split larger work into independently
+        # bound phases instead of buying an unbounded transcript.
         activity_turns, context_growth = {
-            "inspect": (6, 8_000),
-            "retrieve": (7, 10_000),
+            "inspect": (2, 4_000),
+            "retrieve": (3, 5_000),
             "summarize": (2, 2_000),
-            "prepare_external": (3, 3_000),
-            "frame": (3, 3_000),
-            "design": (5, 5_000),
-            "implement": (8, 12_000),
-            "analyze": (6, 8_000),
-            "draft": (5, 5_000),
-            "verify": (5, 8_000),
-            "interpret": (5, 5_000),
-            "execute_runbook": (6, 10_000),
-            "diagnose": (8, 12_000),
-            "synthesize": (6, 5_000),
-            "plan": (5, 4_000),
-            "review": (6, 8_000),
-            "adjudicate": (5, 4_000),
-            "release": (5, 6_000),
-            "architecture": (5, 4_000),
-            "threat_model": (7, 6_000),
-        }.get(request.get("activity"), (5, 6_000))
+            "prepare_external": (2, 3_000),
+            "frame": (2, 3_000),
+            "design": (2, 4_000),
+            "implement": (2, 6_000),
+            "analyze": (3, 5_000),
+            "draft": (2, 4_000),
+            "verify": (2, 5_000),
+            "interpret": (2, 4_000),
+            "execute_runbook": (3, 5_000),
+            "diagnose": (3, 6_000),
+            "synthesize": (2, 4_000),
+            "plan": (2, 3_000),
+            "review": (2, 5_000),
+            "adjudicate": (2, 4_000),
+            "release": (2, 5_000),
+            "architecture": (2, 4_000),
+            "threat_model": (3, 5_000),
+        }.get(request.get("activity"), (2, 4_000))
         scope_factor = {
             "local": 1.0,
             "multi_file": 1.35,
@@ -1676,10 +2208,10 @@ def derived_token_budget(
         )
         estimated_inferences = max(1, math.ceil(activity_turns * complexity_factor))
         work_allowance = {
-            "T1": 8_000,
-            "T2": 24_000,
-            "T3": 48_000,
-            "T4": 96_000,
+            "T1": 6_000,
+            "T2": 16_000,
+            "T3": 32_000,
+            "T4": 64_000,
         }[resolution["tier"]]
         factors = {
             "activity_turns": activity_turns,
@@ -1689,11 +2221,12 @@ def derived_token_budget(
             "context_growth_per_inference": context_growth,
             "tier": resolution["tier"],
             "exact_output": False,
+            "efficiency_profile": "bounded-tool-loop-v2",
         }
     per_inference_input = built_in_context_reserve + prompt_tokens_estimate
     growth_total = 0
     if exact_output is None and tool_mode != "none":
-        context_growth_horizon = 4
+        context_growth_horizon = 2
         growth_steps = sum(
             min(index, context_growth_horizon)
             for index in range(estimated_inferences)
@@ -1708,9 +2241,21 @@ def derived_token_budget(
         per_inference_input * estimated_inferences + growth_total + work_allowance
     )
     derived_cap = ((derived_cap + 999) // 1_000) * 1_000
+    model_cycle_cap = estimated_inferences
+    tool_cycle_cap = (
+        0 if exact_output is not None or tool_mode == "none" else estimated_inferences * 2
+    )
     return {
         "mode": "derived",
         "token_cap": derived_cap,
+        "model_cycle_cap": model_cycle_cap,
+        "tool_cycle_cap": tool_cycle_cap,
+        "recommended_wall_time_seconds": {
+            "T1": 300,
+            "T2": 600,
+            "T3": 900,
+            "T4": 1200,
+        }[resolution["tier"]],
         "prompt_tokens_estimate": prompt_tokens_estimate,
         "built_in_context_reserve_per_inference": built_in_context_reserve,
         "estimated_inferences": estimated_inferences,
@@ -1751,6 +2296,45 @@ def no_tools_item_violation(
         not isinstance(item_type, str)
         or item_type not in NO_TOOLS_PASSIVE_ITEM_TYPES
     )
+
+
+def observed_cycle_counts(
+    events: list[dict[str, Any]], thread_id: str, turn_id: str
+) -> dict[str, int]:
+    """Count harness-started model turns and tool calls as separate resources.
+
+    App Server may emit several ``reasoning`` items during one provider turn;
+    those items are not evidence of separate model invocations. The harness can
+    prove each ``turn/start`` it issued, so that is the model-cycle unit.
+    """
+    started_turn_ids: set[str] = set()
+    tool_ids: set[str] = set()
+    for event in events:
+        if not scoped_to_turn(event, thread_id, turn_id):
+            continue
+        if event.get("method") == "turn/started":
+            nested_turn = event.get("params", {}).get("turn", {})
+            nested_turn_id = (
+                nested_turn.get("id") if isinstance(nested_turn, dict) else None
+            )
+            if isinstance(nested_turn_id, str) and nested_turn_id:
+                started_turn_ids.add(nested_turn_id)
+            continue
+        if event.get("method") not in {"item/started", "item/completed"}:
+            continue
+        item = event.get("params", {}).get("item", {})
+        if not isinstance(item, dict):
+            continue
+        item_type = item.get("type")
+        item_id = item.get("id")
+        if not isinstance(item_id, str) or not item_id:
+            continue
+        if item_type not in NO_TOOLS_PASSIVE_ITEM_TYPES:
+            tool_ids.add(item_id)
+    return {
+        "model_cycles": len(started_turn_ids),
+        "tool_cycles": len(tool_ids),
+    }
 
 
 def validate_runtime_event_shapes(
@@ -1806,6 +2390,8 @@ def _runtime_record_unchecked(
     turn_id: str,
     requested: dict[str, str],
     token_cap: int,
+    model_cycle_cap: int | None = None,
+    tool_cycle_cap: int | None = None,
     tool_mode: str = "default",
     require_tool_use: bool = False,
 ) -> tuple[dict[str, Any], list[str]]:
@@ -1904,6 +2490,7 @@ def _runtime_record_unchecked(
     input_tokens = usage.get("inputTokens")
     output_tokens = usage.get("outputTokens")
     total_tokens = usage.get("totalTokens")
+    cycles = observed_cycle_counts(events, thread_id, turn_id)
     turn_status = (
         completed[-1].get("params", {}).get("turn", {}).get("status")
         if completed
@@ -1964,6 +2551,16 @@ def _runtime_record_unchecked(
         issues.append("measured token usage is missing or invalid")
     elif total_tokens > token_cap:
         issues.append(f"token cap exceeded: {total_tokens} > {token_cap}")
+    if model_cycle_cap is not None and cycles["model_cycles"] > model_cycle_cap:
+        issues.append(
+            "model cycle cap exceeded: "
+            f"{cycles['model_cycles']} > {model_cycle_cap}"
+        )
+    if tool_cycle_cap is not None and cycles["tool_cycles"] > tool_cycle_cap:
+        issues.append(
+            "tool cycle cap exceeded: "
+            f"{cycles['tool_cycles']} > {tool_cycle_cap}"
+        )
     if reroutes:
         issues.append("runtime reroute observed")
     if safety:
@@ -1993,6 +2590,7 @@ def _runtime_record_unchecked(
             "completed_agent_message_ids": message_ids,
             "usage": {"input_tokens": input_tokens, "output_tokens": output_tokens},
             "total_tokens": total_tokens,
+            **cycles,
             "reroutes": reroutes,
             "safety_buffering": safety,
             "tool_item_types": tool_item_types,
@@ -2009,6 +2607,8 @@ def runtime_record(
     turn_id: str,
     requested: dict[str, str],
     token_cap: int,
+    model_cycle_cap: int | None = None,
+    tool_cycle_cap: int | None = None,
     tool_mode: str = "default",
     require_tool_use: bool = False,
 ) -> tuple[dict[str, Any], list[str]]:
@@ -2020,6 +2620,8 @@ def runtime_record(
             turn_id=turn_id,
             requested=requested,
             token_cap=token_cap,
+            model_cycle_cap=model_cycle_cap,
+            tool_cycle_cap=tool_cycle_cap,
             tool_mode=tool_mode,
             require_tool_use=require_tool_use,
         )
@@ -2034,7 +2636,7 @@ def runtime_record(
 def execution_status(issues: list[str]) -> str:
     if not issues:
         return "COMPLETED"
-    if any("token cap exceeded" in issue for issue in issues):
+    if any("cap exceeded" in issue for issue in issues):
         return "BUDGET_STOP"
     return "BLOCKED_MODEL_ENFORCEMENT"
 
@@ -3151,6 +3753,8 @@ def _run_resumable_phase(
             cumulative_usage = {
                 **runtime["usage"],
                 "total_tokens": runtime["total_tokens"],
+                "model_cycles": len(turn_ids),
+                "tool_cycles": 0,
             }
             completion_mode = (
                 "uninterrupted"
@@ -3242,6 +3846,19 @@ def _run_resumable_phase(
                     },
                     "usage": cumulative_usage,
                     "duration_ms": cumulative_elapsed_ms,
+                    "accepted_usage": {
+                        "workflow_id": request.get("workflow_id"),
+                        "workflow_version": request.get("workflow_version"),
+                        "phase_id": request.get("phase_id"),
+                        "activity": request.get("activity"),
+                        "model": runtime["observed_model"],
+                        "effort": runtime["observed_effort"],
+                        "tool_mode": "none",
+                        "total_tokens": cumulative_usage["total_tokens"],
+                        "model_cycles": cumulative_usage["model_cycles"],
+                        "tool_cycles": 0,
+                        "duration_ms": cumulative_elapsed_ms,
+                    },
                     "final_output_sha256": sha256_bytes(
                         (runtime.get("output_text") or "").encode("utf-8")
                     ),
@@ -3249,6 +3866,7 @@ def _run_resumable_phase(
                     "genuine_resume_supported": False,
                     "status": "COMPLETED",
                     "issues": [],
+                    **workflow_receipt_fields(args, status="COMPLETED", issues=[]),
                 }
             )
             write_json(
@@ -3389,6 +4007,19 @@ def run_phase(args: argparse.Namespace) -> int:
     cwd = args.cwd.expanduser().resolve()
     if not cwd.is_absolute() or not cwd.is_dir():
         raise DispatchError(f"working directory is missing: {cwd}")
+    packet = plan_binding.get("dispatch_packet") if plan_binding else None
+    requirements = _skill_requirements_from_packet(packet, cwd)
+    if requirements["source_commit"] != source_commit_for(cwd):
+        raise DispatchError("dispatch source commit changed after packet binding")
+    try:
+        governance.validate_skill_requirements(
+            requirements["required_skills"],
+            source_commit=requirements["source_commit"],
+        )
+    except governance.GovernanceError as error:
+        raise DispatchError(f"required skill admission failed: {error}") from error
+    args._skill_requirements = requirements
+    args._planned_phase = plan_binding.get("phase") if plan_binding else None
     unresolved_prompt_path = args.prompt_file.expanduser().absolute()
     if unresolved_prompt_path.is_symlink() or not unresolved_prompt_path.is_file():
         raise DispatchError(
@@ -3430,6 +4061,12 @@ def run_phase(args: argparse.Namespace) -> int:
             f"\n\n[BEGIN BOUND CONTEXT: {context_path}]\n"
             f"{context_text}\n[END BOUND CONTEXT: {context_path}]"
         )
+    context_bundle = context_bundle_record(
+        context_records,
+        mode=(
+            "precomputed-planner-packet" if plan_binding else "direct-hashed"
+        ),
+    )
     if plan_binding:
         expected_packet = expected_dispatch_packet(
             plan_binding,
@@ -3446,8 +4083,17 @@ def run_phase(args: argparse.Namespace) -> int:
         if plan_binding
         else None
     )
+    requested_model_cycle_cap = getattr(args, "model_cycle_cap", None)
+    requested_tool_cycle_cap = getattr(args, "tool_cycle_cap", None)
+    budget_increase_contract_path = getattr(
+        args, "budget_increase_contract", None
+    )
     if resume_contract is not None and (
-        args.token_cap is not None or args.expect_exact_output is not None
+        args.token_cap is not None
+        or requested_model_cycle_cap is not None
+        or requested_tool_cycle_cap not in {None, 0}
+        or budget_increase_contract_path is not None
+        or args.expect_exact_output is not None
     ):
         raise DispatchError(
             "resumable execution uses only its bound derived cumulative budget"
@@ -3480,6 +4126,7 @@ def run_phase(args: argparse.Namespace) -> int:
         },
         "prompt_sha256": sha256_bytes(prompt.encode("utf-8")),
         "context_files": context_records,
+        "context_bundle": context_bundle,
         "cwd": str(cwd),
         "runner_sha256": runner_hash,
         "profile_sha256": resolution["profile_sha256"],
@@ -3500,28 +4147,119 @@ def run_phase(args: argparse.Namespace) -> int:
             if plan_binding
             else None
         ),
+        "source_commit": source_commit_for(cwd),
     }
-    fixed_cap_contract = validate_explicit_token_cap(
-        args.token_cap,
-        getattr(args, "token_cap_contract", None),
-        token_cap_task_binding,
+    fixed_cap_contract = (
+        validate_explicit_token_cap(
+            args.token_cap,
+            getattr(args, "token_cap_contract", None),
+            token_cap_task_binding,
+        )
+        if args.token_cap_contract is not None
+        else None
     )
-    token_budget = derived_token_budget(
+    cold_start_budget = derived_token_budget(
         request,
         resolution,
         prompt,
         exact_output=args.expect_exact_output,
         tool_mode=args.tool_mode,
     )
-    if args.token_cap is not None:
-        token_budget = {
-            **token_budget,
-            "mode": "explicit",
-            "derived_token_cap": token_budget["token_cap"],
-            "token_cap": args.token_cap,
-            "fixed_task_contract": fixed_cap_contract,
-        }
-    token_cap = token_budget["token_cap"]
+    estimated_inferences = cold_start_budget.get("estimated_inferences", 1)
+    cold_start_budget = {
+        **cold_start_budget,
+        "model_cycle_cap": cold_start_budget.get(
+            "model_cycle_cap", estimated_inferences
+        ),
+        "tool_cycle_cap": cold_start_budget.get(
+            "tool_cycle_cap",
+            0 if args.tool_mode == "none" else estimated_inferences * 2,
+        ),
+        "recommended_wall_time_seconds": cold_start_budget.get(
+            "recommended_wall_time_seconds", args.wall_time_seconds
+        ),
+    }
+    token_budget = apply_measured_success_envelope(
+        cold_start_budget, request, resolution, args.tool_mode
+    )
+    measured_limits = {
+        "token_cap": token_budget["token_cap"],
+        "model_cycle_cap": token_budget["model_cycle_cap"],
+        "tool_cycle_cap": token_budget["tool_cycle_cap"],
+        "wall_time_seconds": min(
+            args.wall_time_seconds,
+            token_budget["recommended_wall_time_seconds"],
+        ),
+    }
+    requested_limits = {
+        "token_cap": (
+            args.token_cap
+            if args.token_cap is not None
+            else measured_limits["token_cap"]
+        ),
+        "model_cycle_cap": (
+            requested_model_cycle_cap
+            if requested_model_cycle_cap is not None
+            else measured_limits["model_cycle_cap"]
+        ),
+        "tool_cycle_cap": (
+            requested_tool_cycle_cap
+            if requested_tool_cycle_cap is not None
+            else measured_limits["tool_cycle_cap"]
+        ),
+        "wall_time_seconds": (
+            args.wall_time_seconds
+            if budget_increase_contract_path is not None
+            else measured_limits["wall_time_seconds"]
+        ),
+    }
+    if args.tool_mode == "none" and requested_limits["tool_cycle_cap"] != 0:
+        raise DispatchError("a no-tools phase must have a zero tool-cycle cap")
+    increased = any(
+        requested_limits[field] > measured_limits[field]
+        for field in measured_limits
+    )
+    budget_task_binding = {
+        **token_cap_task_binding,
+        "measured_limits": measured_limits,
+        "requested_limits": requested_limits,
+    }
+    budget_increase = None
+    if increased:
+        if budget_increase_contract_path is None:
+            raise DispatchError(
+                "a requested limit exceeds the measured envelope; "
+                "--budget-increase-contract is required"
+            )
+        budget_increase = validate_budget_increase_contract(
+            budget_increase_contract_path,
+            task_binding=budget_task_binding,
+            measured_limits=measured_limits,
+            requested_limits=requested_limits,
+        )
+    elif budget_increase_contract_path is not None:
+        raise DispatchError(
+            "--budget-increase-contract is valid only when a requested limit increases"
+        )
+    token_budget = {
+        **token_budget,
+        "cold_start_limits": {
+            "token_cap": cold_start_budget["token_cap"],
+            "model_cycle_cap": cold_start_budget["model_cycle_cap"],
+            "tool_cycle_cap": cold_start_budget["tool_cycle_cap"],
+            "wall_time_seconds": cold_start_budget[
+                "recommended_wall_time_seconds"
+            ],
+        },
+        "measured_limits": measured_limits,
+        "effective_limits": requested_limits,
+        "fixed_task_contract": fixed_cap_contract,
+        "budget_increase_contract": budget_increase,
+    }
+    token_cap = requested_limits["token_cap"]
+    model_cycle_cap = requested_limits["model_cycle_cap"]
+    tool_cycle_cap = requested_limits["tool_cycle_cap"]
+    effective_wall_time_seconds = requested_limits["wall_time_seconds"]
     initial_checkpoint_path = getattr(args, "resume_checkpoint", None)
     initial_checkpoint: dict[str, Any] | None = None
     if initial_checkpoint_path is not None:
@@ -3537,16 +4275,16 @@ def run_phase(args: argparse.Namespace) -> int:
         if initial_checkpoint.get("binding", {}).get("run_root") != str(root):
             raise DispatchError("resume checkpoint is foreign to this run directory")
     else:
-        root = (
-            args.output_dir.expanduser().resolve()
-            if args.output_dir
-            else RUNS / f"{timestamp}-{safe_slug(request['phase_id'])}"
-        )
-        root.mkdir(
-            parents=True,
-            exist_ok=False,
-            mode=0o700 if resume_contract is not None else 0o755,
-        )
+        mode = 0o700 if resume_contract is not None else 0o755
+        if args.output_dir:
+            root = args.output_dir.expanduser().resolve()
+            root.mkdir(parents=True, exist_ok=False, mode=mode)
+        else:
+            root = allocate_run_directory(
+                RUNS,
+                f"{timestamp}-{safe_slug(request['phase_id'])}",
+                mode=mode,
+            )
         if resume_contract is not None:
             os.chmod(root, 0o700)
     copied_prompt = root / "prompt.txt"
@@ -3569,6 +4307,7 @@ def run_phase(args: argparse.Namespace) -> int:
         "runtime": "pinned-openai-codex-app-server",
         "tool_surface": tool_surface,
         "context_files": context_records,
+        "context_bundle": context_bundle,
         "runner_sha256": runner_hash,
         "profile_sha256": resolution["profile_sha256"],
         "permissions": {
@@ -3580,7 +4319,8 @@ def run_phase(args: argparse.Namespace) -> int:
         "service_tier": requested_service,
         "normalized_service_tier": selected_service_tier,
         "retry_rule": {"cognitive_retries": 0, "transient_retries": 0},
-        "wall_time_cap_seconds": args.wall_time_seconds,
+        "wall_time_cap_seconds": effective_wall_time_seconds,
+        "requested_wall_time_ceiling_seconds": args.wall_time_seconds,
         "token_budget": token_budget,
         "token_cap_task_binding_sha256": content_hash(token_cap_task_binding),
         "dispatch_packet_sha256": (
@@ -3641,7 +4381,7 @@ def run_phase(args: argparse.Namespace) -> int:
     cap_interrupt_reason: str | None = None
     try:
         server = AppServer(runner, transcript, stderr_path)
-        deadline = started_at + args.wall_time_seconds
+        deadline = started_at + effective_wall_time_seconds
         server.send(
             {
                 "id": 1,
@@ -3668,7 +4408,9 @@ def run_phase(args: argparse.Namespace) -> int:
             + "\n\nThis route is bound to the supplied phase only. Do not spawn agents. "
             "Do not claim external authority. Stop and report any required scope expansion. "
             f"The derived phase budget allows about {token_budget['estimated_inferences']} "
-            f"model inferences and {token_cap} total tokens; minimize redundant tool loops."
+            f"model inferences, at most {model_cycle_cap} observed model cycles, "
+            f"at most {tool_cycle_cap} tool cycles, {token_cap} total tokens, and "
+            f"{effective_wall_time_seconds} seconds; minimize redundant tool loops."
         )
         if args.tool_mode == "none":
             developer_instructions += (
@@ -3727,8 +4469,53 @@ def run_phase(args: argparse.Namespace) -> int:
         if not isinstance(turn_id, str) or not turn_id:
             raise DispatchError("App Server omitted the turn ID")
         interrupted = False
+        # One ordinary dispatch owns exactly one harness-started model turn.
+        # Reasoning items may fragment within it and are not separate cycles.
+        observed_model_cycle_ids: set[str] = {turn_id}
+        observed_tool_cycle_ids: set[str] = set()
         while True:
             event = server.next_event(deadline)
+            if event.get("method") == "item/started" and scoped_to_turn(
+                event, thread_id, turn_id
+            ):
+                item = event.get("params", {}).get("item", {})
+                item_type = item.get("type") if isinstance(item, dict) else None
+                item_id = item.get("id") if isinstance(item, dict) else None
+                if isinstance(item_id, str) and item_id:
+                    if item_type not in NO_TOOLS_PASSIVE_ITEM_TYPES:
+                        observed_tool_cycle_ids.add(item_id)
+                if (
+                    len(observed_model_cycle_ids) > model_cycle_cap
+                    and not interrupted
+                ):
+                    cap_interrupt_reason = (
+                        "model cycle cap exceeded: "
+                        f"{len(observed_model_cycle_ids)} > {model_cycle_cap}"
+                    )
+                    server.send(
+                        {
+                            "id": 4,
+                            "method": "turn/interrupt",
+                            "params": {"threadId": thread_id, "turnId": turn_id},
+                        }
+                    )
+                    interrupted = True
+                if (
+                    len(observed_tool_cycle_ids) > tool_cycle_cap
+                    and not interrupted
+                ):
+                    cap_interrupt_reason = (
+                        "tool cycle cap exceeded: "
+                        f"{len(observed_tool_cycle_ids)} > {tool_cycle_cap}"
+                    )
+                    server.send(
+                        {
+                            "id": 4,
+                            "method": "turn/interrupt",
+                            "params": {"threadId": thread_id, "turnId": turn_id},
+                        }
+                    )
+                    interrupted = True
             if (
                 args.tool_mode == "none"
                 and no_tools_item_violation(event, thread_id, turn_id)
@@ -3813,6 +4600,8 @@ def run_phase(args: argparse.Namespace) -> int:
             turn_id=turn_id,
             requested=requested,
             token_cap=token_cap,
+            model_cycle_cap=model_cycle_cap,
+            tool_cycle_cap=tool_cycle_cap,
             tool_mode=args.tool_mode,
             require_tool_use=(
                 request.get("mutation") != "none"
@@ -3873,8 +4662,11 @@ def run_phase(args: argparse.Namespace) -> int:
         },
         "limits": {
             "token_cap": token_cap,
+            "model_cycle_cap": model_cycle_cap,
+            "tool_cycle_cap": tool_cycle_cap,
             "token_budget": token_budget,
-            "wall_time_seconds": args.wall_time_seconds,
+            "wall_time_seconds": effective_wall_time_seconds,
+            "requested_wall_time_ceiling_seconds": args.wall_time_seconds,
             "elapsed_ms": int((time.monotonic() - started_at) * 1000),
         },
         "issues": issues,
@@ -3937,13 +4729,29 @@ def run_phase(args: argparse.Namespace) -> int:
                     "usage": {
                         **runtime["usage"],
                         "total_tokens": runtime["total_tokens"],
+                        "model_cycles": runtime["model_cycles"],
+                        "tool_cycles": runtime["tool_cycles"],
                     },
                     "duration_ms": duration_ms,
+                    "accepted_usage": {
+                        "workflow_id": request.get("workflow_id"),
+                        "workflow_version": request.get("workflow_version"),
+                        "phase_id": request.get("phase_id"),
+                        "activity": request.get("activity"),
+                        "model": runtime["observed_model"],
+                        "effort": runtime["observed_effort"],
+                        "tool_mode": args.tool_mode,
+                        "total_tokens": runtime["total_tokens"],
+                        "model_cycles": runtime["model_cycles"],
+                        "tool_cycles": runtime["tool_cycles"],
+                        "duration_ms": duration_ms,
+                    },
                     "final_output_sha256": sha256_bytes(
                         (runtime.get("output_text") or "").encode("utf-8")
                     ),
                     "status": "COMPLETED",
                     "issues": [],
+                    **workflow_receipt_fields(args, status="COMPLETED", issues=[]),
                 }
             )
             write_json(
@@ -4413,6 +5221,9 @@ def run_smoke(args: argparse.Namespace) -> int:
             mutation_authorized=False,
             token_cap=args.token_cap,
             token_cap_contract=args.token_cap_contract,
+            model_cycle_cap=None,
+            tool_cycle_cap=0,
+            budget_increase_contract=None,
             context_file=[],
             tool_mode="none",
             wall_time_seconds=args.wall_time_seconds,
@@ -4588,6 +5399,9 @@ def resume_phase(args: argparse.Namespace) -> int:
         mutation_authorized=binding["permissions"]["mutation_authorized"],
         token_cap=None,
         token_cap_contract=None,
+        model_cycle_cap=None,
+        tool_cycle_cap=None,
+        budget_increase_contract=None,
         wall_time_seconds=resume_contract["attempt_wall_time_seconds"],
         output_dir=root,
         expect_exact_output=None,
@@ -4634,6 +5448,13 @@ def build_parser() -> argparse.ArgumentParser:
         dest="command", required=True, parser_class=DispatchArgumentParser
     )
     commands.add_parser("check", help="Run deterministic planner/dispatcher health gates")
+    skill_read = commands.add_parser(
+        "skill-read", help="Record a fresh, hash-bound read of a required skill"
+    )
+    skill_read.add_argument("--name", required=True)
+    skill_read.add_argument("--skill", type=Path, required=True)
+    skill_read.add_argument("--source-commit", required=True)
+    skill_read.add_argument("--max-age-seconds", type=int, default=3600)
     smoke = commands.add_parser("smoke", help="Run one observed-identity live route smoke")
     smoke.add_argument("--tier", choices=("T1", "T2", "T3", "T4", "rotating"), default="rotating")
     smoke.add_argument(
@@ -4691,6 +5512,21 @@ def build_parser() -> argparse.ArgumentParser:
         type=Path,
         help="Hashed fixed-task contract JSON that binds --token-cap",
     )
+    run.add_argument(
+        "--model-cycle-cap",
+        type=int,
+        help="Optional cap at or below the measured envelope",
+    )
+    run.add_argument(
+        "--tool-cycle-cap",
+        type=int,
+        help="Optional cap at or below the measured envelope",
+    )
+    run.add_argument(
+        "--budget-increase-contract",
+        type=Path,
+        help="Reviewed task-bound contract required to exceed a measured limit",
+    )
     run.add_argument("--wall-time-seconds", type=int, default=900)
     run.add_argument("--resumable", action="store_true")
     run.add_argument("--work-manifest", type=Path)
@@ -4700,6 +5536,13 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--shutdown-window-seconds", type=int)
     run.add_argument("--checkpoint-ttl-seconds", type=int)
     run.add_argument("--output-dir", type=Path)
+    run.add_argument("--tree-id")
+    run.add_argument(
+        "--agent-role", choices=sorted(governance.LEASE_ROLES), default="worker"
+    )
+    run.add_argument("--parent-lease-id")
+    run.add_argument("--nested-capacity-tokens", type=int, default=0)
+    run.add_argument("--lease-seconds", type=int, default=900)
     run.add_argument("--expect-exact-output", help=argparse.SUPPRESS)
     return parser
 
@@ -4769,6 +5612,15 @@ def main() -> int:
         enforce_install_admission(args.command)
         if args.command == "check":
             return check_health()
+        if args.command == "skill-read":
+            receipt = governance.record_skill_read(
+                name=args.name,
+                path=args.skill,
+                source_commit=args.source_commit,
+                max_age_seconds=args.max_age_seconds,
+            )
+            print(json.dumps(receipt, indent=2, sort_keys=True))
+            return 0
         if args.command == "smoke":
             if (args.token_cap is not None and args.token_cap < 1) or args.wall_time_seconds < 1:
                 parser.error("smoke caps must be positive")
@@ -4803,11 +5655,41 @@ def main() -> int:
             parser.error("resume options require --resumable")
         if args.token_cap is not None and args.token_cap < 1:
             parser.error("--token-cap must be positive")
-        if bool(args.token_cap is not None) != bool(args.token_cap_contract):
-            parser.error("--token-cap and --token-cap-contract must be supplied together")
+        if args.token_cap_contract is not None and args.token_cap is None:
+            parser.error("--token-cap-contract requires --token-cap")
+        if args.model_cycle_cap is not None and args.model_cycle_cap < 1:
+            parser.error("--model-cycle-cap must be positive")
+        if args.tool_cycle_cap is not None and args.tool_cycle_cap < 0:
+            parser.error("--tool-cycle-cap cannot be negative")
         if args.wall_time_seconds < 1:
             parser.error("--wall-time-seconds must be positive")
-        return run_phase(args)
+        tree_id = args.tree_id or f"dispatch-{uuid.uuid4().hex}"
+        reservation = governance.reserve_agent(
+            tree_id=tree_id,
+            role=args.agent_role,
+            parent_lease_id=args.parent_lease_id,
+            nested_capacity_tokens=args.nested_capacity_tokens,
+            lease_seconds=args.lease_seconds,
+        )
+        lease = reservation["lease"]
+        args._agent_lease = lease
+        try:
+            result = run_phase(args)
+        except Exception as error:
+            governance.complete_reservation(
+                reservation, status="ABORTED", reason=str(error)
+            )
+            raise
+        terminal = governance.complete_reservation(
+            reservation,
+            status="COMPLETED" if result == 0 else "BLOCKED",
+            reason="dispatcher accepted phase" if result == 0 else "dispatcher rejected phase",
+        )
+        # The execution artifact is printed by run_phase.  This short, immediate
+        # receipt makes capacity release observable even when the worker output
+        # is truncated by a calling harness.
+        print(json.dumps(terminal, sort_keys=True))
+        return result
     except Exception as error:
         failure_args = args or failure_namespace_from_argv(sys.argv[1:])
         artifact = write_setup_failure_artifact(failure_args, error)

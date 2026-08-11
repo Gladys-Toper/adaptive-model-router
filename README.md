@@ -2,6 +2,8 @@
 
 Evidence-gated model and workflow routing skills for Codex. The router assigns each phase to the smallest proven model/reasoning tier, while the workflow harness composes multi-phase work and preserves execution evidence, promotion gates, and rollback.
 
+Planned work prefers fixed hash-bound context bundles. Tokens, harness-started model turns, tool calls, and wall time are capped independently; internal reasoning fragments do not inflate the model-turn count. Accepted execution receipts feed route-specific successful-use distributions; model cost/quota weights constrain headroom, and any larger envelope requires retained evidence plus an independent review receipt.
+
 ## Included skills
 
 - `adaptive-model-router` — model, reasoning-tier, evaluation, promotion, and rollback authority.
@@ -45,6 +47,7 @@ The skills are installed under `$CODEX_HOME/skills` (normally `~/.codex/skills`)
 python3 skills/adaptive-model-router/scripts/test_router_lab.py
 python3 skills/adaptive-workflow-router/scripts/test_workflow_plan.py
 python3 skills/adaptive-workflow-router/scripts/test_workflow_dispatch.py
+python3 skills/adaptive-workflow-router/scripts/test_agent_governance.py
 python3 skills/adaptive-workflow-router/scripts/test_learning_loop.py
 ```
 

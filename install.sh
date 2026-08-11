@@ -41,6 +41,7 @@ python3 "${TARGET_SKILLS_DIR}/adaptive-model-router/scripts/router_lab.py" sync-
 python3 "${TARGET_SKILLS_DIR}/adaptive-model-router/scripts/router_lab.py" status
 python3 "${TARGET_SKILLS_DIR}/adaptive-workflow-router/scripts/test_workflow_plan.py"
 python3 "${TARGET_SKILLS_DIR}/adaptive-workflow-router/scripts/test_workflow_dispatch.py"
+python3 "${TARGET_SKILLS_DIR}/adaptive-workflow-router/scripts/test_agent_governance.py"
 python3 "${TARGET_SKILLS_DIR}/adaptive-workflow-router/scripts/test_learning_loop.py"
 
 echo "Installation complete. Start a new Codex turn to use the skills."

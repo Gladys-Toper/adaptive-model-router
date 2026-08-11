@@ -8,6 +8,7 @@ import importlib.util
 import json
 import os
 import tempfile
+import tomllib
 import types
 from pathlib import Path
 from typing import Any
@@ -496,6 +497,179 @@ def test_transcript_latency_is_bound_and_derived() -> None:
         raise AssertionError("zero transcript duration was accepted")
 
 
+def test_daybreak_is_bounded_security_evaluation_only() -> None:
+    assert ROUTER.is_daybreak_model("gpt-daybreak-blue-latest")
+    for tier, trigger, security_candidate in (
+        ("T3", "catalog-change", False),
+        ("T2", "explicit-reoptimization", True),
+        ("T3", "explicit-reoptimization", False),
+    ):
+        try:
+            ROUTER.stage_candidate_internal(
+                {"items": []},
+                {"models": {}},
+                {},
+                "gpt-daybreak-blue-latest",
+                tier,
+                trigger=trigger,
+                security_candidate=security_candidate,
+            )
+        except ROUTER.RouterLabError as error:
+            assert "daybreak" in str(error)
+        else:
+            raise AssertionError("unbounded daybreak candidate was accepted")
+    try:
+        ROUTER.promote_candidate_internal(
+            {"items": []},
+            {"status": "qualified", "candidate_model": "gpt-daybreak-blue-latest"},
+            {},
+            {},
+        )
+    except ROUTER.RouterLabError as error:
+        assert "evaluation-only" in str(error)
+    else:
+        raise AssertionError("daybreak candidate became an active general route")
+
+
+def test_family_observability_rebaseline_is_atomic_and_narrow() -> None:
+    with tempfile.TemporaryDirectory(
+        prefix="adaptive-router-family-rebaseline-"
+    ) as temporary:
+        module = load_isolated_router(Path(temporary))
+        old_source = raw_catalog("old-family-instructions")
+        for model in old_source["models"]:
+            model["base_instructions"] = "old-family-instructions"
+            model["model_messages"] = {
+                "instructions_template": "old-family-instructions"
+            }
+            model["supports_reasoning_summaries"] = True
+        write_json(module.CATALOG_SOURCE, old_source)
+        old_catalog = module.read_catalog_snapshot()
+
+        policy = json.loads(module.DEFAULT_POLICY_PATH.read_text(encoding="utf-8"))
+        policy["constraints"]["model_version_window"] = {
+            "max_version_lag": 0,
+            "latest_observed_family": "5.6",
+            "allowed_families": ["5.6"],
+        }
+        policy["policy_id"] = module.policy_id(policy)
+        module.atomic_write_json(module.ACTIVE_POLICY_PATH, policy)
+        module.atomic_write_json(module.CATALOG_PATH, old_catalog)
+        module.AGENTS_DIR.mkdir(parents=True, exist_ok=True)
+        for name, text in module.rendered_active_bundle(policy).items():
+            module.atomic_write_text(module.AGENTS_DIR / name, text)
+
+        candidates = {"schema_version": 1, "items": []}
+        old_candidate = module.stage_candidate_internal(
+            candidates,
+            old_catalog,
+            policy,
+            "gpt-5.6-luna",
+            "T2",
+            trigger="test-family-observability-contract",
+        )
+        assert old_candidate is not None
+        module.atomic_write_json(module.CANDIDATES_PATH, candidates)
+
+        policy_before = module.ACTIVE_POLICY_PATH.read_bytes()
+        profiles_before = module.installed_bundle_hashes()
+        new_source = copy.deepcopy(old_source)
+        for model in new_source["models"]:
+            model["base_instructions"] = "new-family-instructions"
+            model["model_messages"] = {
+                "instructions_template": "new-family-instructions"
+            }
+            model["supports_reasoning_summaries"] = False
+        write_json(module.CATALOG_SOURCE, new_source)
+
+        result = module.refresh_catalog(stage_new=False)
+        assert result["status"] == "CHANGED"
+        assert result["failovers"] == []
+        assert module.ACTIVE_POLICY_PATH.read_bytes() == policy_before
+        assert module.installed_bundle_hashes() == profiles_before
+        assert [item["tier"] for item in result["active_revision_rebaselines"]] == [
+            "T1",
+            "T2",
+            "T3",
+            "T4",
+        ]
+        for item in result["active_revision_rebaselines"]:
+            assert item["changed_fields"] == [
+                "instruction_hash",
+                "supports_reasoning_summaries",
+            ]
+            assert item["old_supports_reasoning_summaries"] is True
+            assert item["new_supports_reasoning_summaries"] is False
+            assert item["reason"] == (
+                "active-family-observability-contract-rebaseline"
+            )
+        stale = next(
+            item
+            for item in module.load_candidates()["items"]
+            if item["candidate_id"] == old_candidate["candidate_id"]
+        )
+        assert stale["status"] == "stale"
+        assert module.doctor()["routing_status"] == "HEALTHY"
+
+        current_catalog = module.read_json(module.CATALOG_PATH)
+        partial = copy.deepcopy(current_catalog)
+        luna = partial["models"]["gpt-5.6-luna"]
+        luna["instruction_hash"] = "partial-instruction-change"
+        luna["supports_reasoning_summaries"] = True
+        refresh_revision_for(module, luna)
+        partial_changes = module.catalog_change_classification(
+            current_catalog, partial, schema_upgrade=False
+        )
+        force, rebaselines = module.active_revision_transition_plan(
+            policy, current_catalog, partial, partial_changes
+        )
+        assert force == {"T1"}
+        assert rebaselines == []
+
+        nonuniform = copy.deepcopy(current_catalog)
+        for slug in {policy["tiers"][tier]["model"] for tier in module.VALID_TIERS}:
+            model = nonuniform["models"][slug]
+            model["instruction_hash"] = f"nonuniform-{slug}"
+            model["supports_reasoning_summaries"] = True
+            refresh_revision_for(module, model)
+        nonuniform_changes = module.catalog_change_classification(
+            current_catalog, nonuniform, schema_upgrade=False
+        )
+        force, rebaselines = module.active_revision_transition_plan(
+            policy, current_catalog, nonuniform, nonuniform_changes
+        )
+        assert force == set(module.VALID_TIERS)
+        assert rebaselines == []
+
+
+def refresh_revision_for(module: Any, model: dict[str, Any]) -> None:
+    material = copy.deepcopy(model)
+    material.pop("revision_hash", None)
+    model["revision_hash"] = module.content_id(material)
+
+
+def test_checked_in_profiles_match_default_policy() -> None:
+    skill_root = SCRIPT.parent.parent
+    policy = json.loads(
+        (skill_root / "assets" / "default-policy.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    for tier in ("T1", "T2", "T3", "T4"):
+        assignment = policy["tiers"][tier]
+        profile = tomllib.loads(
+            (
+                skill_root
+                / "assets"
+                / "custom-agents"
+                / assignment["profile_file"]
+            ).read_text(encoding="utf-8")
+        )
+        assert profile["name"] == assignment["agent"]
+        assert profile["model"] == assignment["model"]
+        assert profile["model_reasoning_effort"] == assignment["effort"]
+
+
 def load_isolated_router(root: Path) -> Any:
     codex_home = root / "codex-home"
     os.environ["ADAPTIVE_MODEL_ROUTER_TEST_ROOT"] = str(root)
@@ -524,4 +698,7 @@ if __name__ == "__main__":
         test_top_tier_baseline_gate_and_cache()
         test_input_manifest_validation(test_root)
         test_transcript_latency_is_bound_and_derived()
+        test_daybreak_is_bounded_security_evaluation_only()
+        test_family_observability_rebaseline_is_atomic_and_narrow()
+        test_checked_in_profiles_match_default_policy()
     print("adaptive-model-router deterministic tests passed")

@@ -190,6 +190,16 @@ def content_hash(value: Any) -> str:
     return hashlib.sha256(canonical_json(value).encode("utf-8")).hexdigest()
 
 
+def context_bundle_record(context_files: list[dict[str, Any]]) -> dict[str, Any]:
+    identity = {
+        "schema_version": 1,
+        "mode": "precomputed-planner-packet",
+        "files": context_files,
+        "total_bytes": sum(record["bytes"] for record in context_files),
+    }
+    return {**identity, "bundle_sha256": content_hash(identity)}
+
+
 def absolute_without_resolving(path: Path) -> Path:
     return path.expanduser().absolute()
 
@@ -1741,9 +1751,96 @@ def resolve_dispatch_cwd(path: Path) -> Path:
     return absolute.resolve(strict=True)
 
 
+def source_commit_for(cwd: Path) -> str:
+    try:
+        completed = subprocess.run(
+            ["git", "-C", str(cwd), "rev-parse", "HEAD"],
+            text=True,
+            capture_output=True,
+            timeout=10,
+            check=False,
+        )
+        value = completed.stdout.strip().lower()
+        if len(value) in {40, 64} and all(character in "0123456789abcdef" for character in value):
+            return value
+    except (OSError, subprocess.SubprocessError):
+        pass
+    return os.environ.get("ADAPTIVE_WORKFLOW_SOURCE_COMMIT", "0" * 40)
+
+
+def load_required_skills(path: Path | None, cwd: Path) -> dict[str, Any]:
+    """Load the immutable skill contract; dispatch verifies fresh read receipts."""
+    if path is None:
+        return {
+            "required_skills": [],
+            "skill_hashes": {},
+            "source_commit": source_commit_for(cwd),
+        }
+    _, raw, contract = read_bound_json(path, "required skills contract")
+    identity = dict(contract)
+    supplied = identity.pop("contract_sha256", None)
+    required = contract.get("required_skills")
+    source_commit = contract.get("source_commit")
+    if (
+        set(contract) != {
+            "schema_version",
+            "contract_name",
+            "source_commit",
+            "required_skills",
+            "contract_sha256",
+        }
+        or contract.get("schema_version") != 1
+        or contract.get("contract_name") != "adaptive-workflow.required-skills"
+        or supplied != content_hash(identity)
+        or not isinstance(required, list)
+        or not isinstance(source_commit, str)
+        or len(source_commit) not in {40, 64}
+        or source_commit != source_commit_for(cwd)
+    ):
+        raise WorkflowError("required skills contract is invalid or source-stale")
+    hashes: dict[str, str] = {}
+    for item in required:
+        if not isinstance(item, dict) or set(item) != {
+            "name", "path", "skill_sha256", "read_receipt_id", "max_age_seconds"
+        }:
+            raise WorkflowError("required skills contract has an invalid skill entry")
+        name = item.get("name")
+        skill_hash = item.get("skill_sha256")
+        if (
+            not isinstance(name, str)
+            or not name
+            or name in hashes
+            or not isinstance(skill_hash, str)
+            or len(skill_hash) != 64
+            or any(character not in "0123456789abcdef" for character in skill_hash)
+        ):
+            raise WorkflowError("required skills contract has duplicate or invalid names")
+        hashes[name] = skill_hash
+    return {
+        "required_skills": required,
+        "skill_hashes": hashes,
+        "source_commit": source_commit,
+        "required_skills_contract_path": str(path.expanduser().resolve(strict=True)),
+        "required_skills_contract_sha256": hashlib.sha256(raw).hexdigest(),
+    }
+
+
 def build_dispatch_packet(args: argparse.Namespace) -> dict[str, Any]:
     if args.wall_time_seconds < 1:
         raise WorkflowError("wall-time-seconds must be a positive integer")
+    token_cap = getattr(args, "token_cap", None)
+    token_cap_contract = getattr(args, "token_cap_contract", None)
+    model_cycle_cap = getattr(args, "model_cycle_cap", None)
+    tool_cycle_cap = getattr(args, "tool_cycle_cap", None)
+    budget_increase_contract = getattr(args, "budget_increase_contract", None)
+    if token_cap is not None and token_cap < 1:
+        raise WorkflowError("token-cap must be a positive integer")
+    if token_cap_contract is not None and token_cap is None:
+        raise WorkflowError("token-cap-contract requires token-cap")
+    if model_cycle_cap is not None and model_cycle_cap < 1:
+        raise WorkflowError("model-cycle-cap must be a positive integer")
+    if tool_cycle_cap is not None and tool_cycle_cap < 0:
+        raise WorkflowError("tool-cycle-cap cannot be negative")
     if args.tool_mode == "none" and (
         args.sandbox != "read-only" or args.network_access
     ):
@@ -1764,6 +1861,16 @@ def build_dispatch_packet(args: argparse.Namespace) -> dict[str, Any]:
                 "bytes": len(raw),
             }
         )
+    cwd = resolve_dispatch_cwd(args.cwd)
+    skills = load_required_skills(args.required_skills_file, cwd)
+
+    def optional_hash(value: Path | None) -> str | None:
+        if value is None:
+            return None
+        resolved, raw = read_dispatch_text(value, "dispatch budget contract")
+        del resolved
+        return hashlib.sha256(raw).hexdigest()
+
     identity = {
         "schema_version": 2 if resume_contract is not None else 1,
         "planner_contract_version": plan["planner_contract_version"],
@@ -1773,14 +1880,27 @@ def build_dispatch_packet(args: argparse.Namespace) -> dict[str, Any]:
         "phase_contract_sha256": content_hash(phase_contract(phase)),
         "prompt_sha256": hashlib.sha256(prompt).hexdigest(),
         "context_files": context_files,
-        "cwd": str(resolve_dispatch_cwd(args.cwd)),
+        "context_bundle": context_bundle_record(context_files),
+        "cwd": str(cwd),
         "runtime_contract": {
             "sandbox": args.sandbox,
             "network_access": args.network_access,
             "tool_mode": args.tool_mode,
             "mutation_authorized": args.mutation_authorized,
             "wall_time_seconds": args.wall_time_seconds,
+            "requested_budget_limits": {
+                "token_cap": token_cap,
+                "model_cycle_cap": model_cycle_cap,
+                "tool_cycle_cap": tool_cycle_cap,
+            },
+            "token_cap_contract_sha256": optional_hash(
+                token_cap_contract
+            ),
+            "budget_increase_contract_sha256": optional_hash(
+                budget_increase_contract
+            ),
         },
+        **skills,
     }
     if resume_contract is not None:
         identity["resume_contract"] = resume_contract
@@ -1889,6 +2009,11 @@ def build_parser() -> argparse.ArgumentParser:
     bind.add_argument("--tool-mode", choices=("default", "none"), required=True)
     bind.add_argument("--mutation-authorized", action="store_true")
     bind.add_argument("--wall-time-seconds", type=int, required=True)
+    bind.add_argument("--token-cap", type=int)
+    bind.add_argument("--token-cap-contract", type=Path)
+    bind.add_argument("--model-cycle-cap", type=int)
+    bind.add_argument("--tool-cycle-cap", type=int)
+    bind.add_argument("--budget-increase-contract", type=Path)
     bind.add_argument("--resumable", action="store_true")
     bind.add_argument("--work-manifest", type=Path)
     bind.add_argument("--max-continuations", type=int)
@@ -1896,6 +2021,11 @@ def build_parser() -> argparse.ArgumentParser:
     bind.add_argument("--checkpoint-window-seconds", type=int)
     bind.add_argument("--shutdown-window-seconds", type=int)
     bind.add_argument("--checkpoint-ttl-seconds", type=int)
+    bind.add_argument(
+        "--required-skills-file",
+        type=Path,
+        help="Self-hashed required-skill/read-receipt contract bound into the packet",
+    )
     bind.add_argument(
         "--output",
         type=Path,
