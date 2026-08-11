@@ -13,12 +13,19 @@ import multiprocessing
 import os
 import sys
 import tempfile
+import time
 from types import SimpleNamespace
 from pathlib import Path
 from typing import Any, Iterator
 
 
 SCRIPT = Path(__file__).resolve().parent / "workflow_dispatch.py"
+CALIBRATION_FIXTURE = (
+    Path(__file__).resolve().parents[1]
+    / "tests"
+    / "fixtures"
+    / "adaptive-budget-calibration-failures-v1.json"
+)
 SPEC = importlib.util.spec_from_file_location("workflow_dispatch", SCRIPT)
 assert SPEC and SPEC.loader
 DISPATCH = importlib.util.module_from_spec(SPEC)
@@ -1012,8 +1019,24 @@ def test_t2_multifile_implementation_budget_is_token_efficient() -> None:
         exact_output=None,
     )
     assert budget["estimated_inferences"] == 3
-    assert budget["token_cap"] <= 110_000
-    assert budget["factors"]["efficiency_profile"] == "bounded-tool-loop-v2"
+    assert budget["turn_cycle_cap"] == 3
+    assert budget["tool_cycle_cap"] == 6
+    assert budget["model_api_call_allowance"] == 7
+    expected = (
+        budget["model_api_call_allowance"]
+        * (
+            budget["built_in_context_reserve_per_api_call"]
+            + budget["prompt_tokens_estimate"]
+        )
+        + budget["estimated_bounded_replayed_growth_tokens"]
+        + budget["work_allowance"]
+    )
+    expected = ((expected + 999) // 1_000) * 1_000
+    assert budget["token_cap"] == expected
+    assert (
+        budget["factors"]["efficiency_profile"]
+        == "bounded-tool-loop-api-accounted-v2"
+    )
 
 
 def test_bound_context_no_tools_budget_is_single_inference() -> None:
@@ -1026,6 +1049,10 @@ def test_bound_context_no_tools_budget_is_single_inference() -> None:
         tool_mode="none",
     )
     assert budget["estimated_inferences"] == 1
+    assert budget["token_cap"] == 53_000
+    assert budget["turn_cycle_cap"] == 1
+    assert budget["tool_cycle_cap"] == 0
+    assert budget["model_api_call_allowance"] == 1
     assert budget["estimated_context_growth_tokens"] == 0
 
 
@@ -1068,9 +1095,230 @@ def test_reasoning_fragments_are_not_model_cycles_and_tools_are_independent() ->
     )
     assert record["model_cycles"] == 1
     assert record["tool_cycles"] == 1
-    assert not any("model cycle cap exceeded" in issue for issue in issues)
+    assert record["turn_cycles"] == 1
+    assert record["model_api_call_updates"] == 1
+    assert not any("turn cycle cap exceeded" in issue for issue in issues)
     assert not any("tool cycle cap exceeded" in issue for issue in issues)
     assert DISPATCH.execution_status(issues) == "COMPLETED"
+
+
+def tool_loop_events(usage_totals: list[int], tool_cycles: int) -> list[dict[str, Any]]:
+    values = events()
+    usage_index = next(
+        index
+        for index, event in enumerate(values)
+        if event.get("method") == "thread/tokenUsage/updated"
+    )
+    values.pop(usage_index)
+    insertion = next(
+        index
+        for index, event in enumerate(values)
+        if event.get("method") == "item/completed"
+    )
+    tool_events = [
+        {
+            "method": "item/started",
+            "params": {
+                "threadId": THREAD,
+                "turnId": TURN,
+                "item": {"type": "commandExecution", "id": f"tool-{index}"},
+            },
+        }
+        for index in range(1, tool_cycles + 1)
+    ]
+    usage_events = [
+        {
+            "method": "thread/tokenUsage/updated",
+            "params": {
+                "threadId": THREAD,
+                "turnId": TURN,
+                "tokenUsage": {
+                    "total": {
+                        "inputTokens": total - 10,
+                        "outputTokens": 10,
+                        "totalTokens": total,
+                    }
+                },
+            },
+        }
+        for total in usage_totals
+    ]
+    values[insertion:insertion] = [*tool_events, *usage_events]
+    return values
+
+
+def test_turn_tool_and_model_api_call_accounting_are_independent() -> None:
+    values = tool_loop_events([20, 40, 60, 80, 100, 120], 3)
+    record, issues = DISPATCH.runtime_record(
+        values,
+        thread_id=THREAD,
+        turn_id=TURN,
+        requested=REQUESTED,
+        token_cap=200,
+        model_cycle_cap=1,
+        tool_cycle_cap=3,
+        model_api_call_allowance=7,
+    )
+    assert record["turn_cycles"] == 1
+    assert record["tool_cycles"] == 3
+    assert record["model_api_call_updates"] == 6
+    assert not issues
+
+    _, breach_issues = DISPATCH.runtime_record(
+        tool_loop_events([20, 40, 60, 80, 100, 120, 140, 160], 6),
+        thread_id=THREAD,
+        turn_id=TURN,
+        requested=REQUESTED,
+        token_cap=200,
+        model_cycle_cap=1,
+        tool_cycle_cap=6,
+        model_api_call_allowance=7,
+    )
+    assert "model API-call allowance exceeded: 8 > 7" in breach_issues
+    assert DISPATCH.model_api_call_allowance("default", 2) == 3
+    assert DISPATCH.model_api_call_allowance("none", 20) == 1
+
+
+def test_usage_regression_and_late_wall_event_fail_closed() -> None:
+    _, issues = DISPATCH.runtime_record(
+        tool_loop_events([60, 40], 0),
+        thread_id=THREAD,
+        turn_id=TURN,
+        requested=REQUESTED,
+        token_cap=100,
+        model_cycle_cap=1,
+        tool_cycle_cap=0,
+        model_api_call_allowance=2,
+    )
+    assert "thread-cumulative token usage moved backwards" in issues
+
+    class LateQueue:
+        @staticmethod
+        def get(timeout: float) -> bytes:
+            time.sleep(timeout + 0.01)
+            return b'{}\n'
+
+    class RunningProcess:
+        returncode = None
+
+        @staticmethod
+        def poll() -> None:
+            return None
+
+    with tempfile.TemporaryDirectory(prefix="workflow-late-event-") as temporary:
+        server = object.__new__(DISPATCH.AppServer)
+        server.stdout = LateQueue()
+        server.process = RunningProcess()
+        server.transcript = Path(temporary) / "late.jsonl"
+        try:
+            server.next_event(time.monotonic() + 0.01)
+        except DISPATCH.AppServerDeadline:
+            pass
+        else:
+            raise AssertionError("an event delivered after the wall deadline was accepted")
+        assert server.transcript.read_bytes() == b'{}\n'
+
+
+def test_calibration_failures_are_static_non_learning_regressions() -> None:
+    fixture = json.loads(CALIBRATION_FIXTURE.read_text(encoding="utf-8"))
+    assert fixture["calibration_role"] == "cold_start_formula_regression_only"
+    for case in fixture["cases"]:
+        assert case["calibration_role"] == fixture["calibration_role"]
+        allowance = DISPATCH.model_api_call_allowance(
+            "default", case["tool_cycle_cap"]
+        )
+        assert allowance == case["model_api_call_allowance"]
+        growth_steps = sum(
+            min(index, case["context_growth_horizon"])
+            for index in range(allowance)
+        )
+        expected_cap = (
+            allowance
+            * (
+                case["built_in_context_reserve_per_api_call"]
+                + case["prompt_tokens_estimate"]
+            )
+            + round(
+                case["context_growth_per_api_call"]
+                * case["scope_factor"]
+                * growth_steps
+            )
+            + case["work_allowance"]
+        )
+        expected_cap = ((expected_cap + 999) // 1_000) * 1_000
+        assert case["v1_token_cap"] < case["usage_totals"][-1]
+        assert expected_cap >= case["minimum_v2_token_cap"]
+        assert expected_cap >= case["usage_totals"][-1]
+        assert case["observed_turn_cycles"] <= case["turn_cycle_cap"]
+        assert case["observed_tool_cycles"] <= case["tool_cycle_cap"]
+        assert len(case["usage_totals"]) <= allowance
+        replay_events = tool_loop_events(
+            case["usage_totals"], case["observed_tool_cycles"]
+        )
+        _, v1_issues = DISPATCH.runtime_record(
+            replay_events,
+            thread_id=THREAD,
+            turn_id=TURN,
+            requested=REQUESTED,
+            token_cap=case["v1_token_cap"],
+            model_cycle_cap=case["turn_cycle_cap"],
+            tool_cycle_cap=case["tool_cycle_cap"],
+            model_api_call_allowance=case["model_api_call_allowance"],
+        )
+        assert any("token cap exceeded" in issue for issue in v1_issues)
+        _, v2_issues = DISPATCH.runtime_record(
+            replay_events,
+            thread_id=THREAD,
+            turn_id=TURN,
+            requested=REQUESTED,
+            token_cap=expected_cap,
+            model_cycle_cap=case["turn_cycle_cap"],
+            tool_cycle_cap=case["tool_cycle_cap"],
+            model_api_call_allowance=case["model_api_call_allowance"],
+        )
+        assert not any(
+            "cap exceeded" in issue or "allowance exceeded" in issue
+            for issue in v2_issues
+        )
+
+    with tempfile.TemporaryDirectory(prefix="workflow-budget-failure-fixture-") as temporary:
+        root = Path(temporary)
+        request = {
+            **DISPATCH.smoke_request("T3"),
+            "workflow_id": "coding.change",
+            "phase_id": "implement",
+        }
+        resolution = {
+            "tier": "T3",
+            "model": "gpt-5.6-terra",
+            "effort": "high",
+        }
+        with isolated_registry(root / "registry") as registry:
+            for case in fixture["cases"]:
+                DISPATCH.append_execution_receipt(
+                    {
+                        "status": "BUDGET_STOP",
+                        "calibration_role": fixture["calibration_role"],
+                        "accepted_usage": {
+                            "workflow_id": "coding.change",
+                            "workflow_version": 1,
+                            "phase_id": "implement",
+                            "model": "gpt-5.6-terra",
+                            "effort": "high",
+                            "tool_mode": "default",
+                            "total_tokens": case["usage_totals"][-1],
+                            "turn_cycles": case["observed_turn_cycles"],
+                            "tool_cycles": case["observed_tool_cycles"],
+                            "duration_ms": 1,
+                        },
+                    }
+                )
+            assert not DISPATCH.accepted_usage_samples(
+                request,
+                resolution,
+                "default",
+                registry_path=registry,
+            )
 
 
 def test_successful_usage_distribution_calibrates_exact_versioned_route() -> None:
@@ -1106,7 +1354,11 @@ def test_successful_usage_distribution_calibrates_exact_versioned_route() -> Non
                             "effort": "medium",
                             "tool_mode": "default",
                             "total_tokens": total,
-                            "model_cycles": 2 + (index % 2),
+                            **(
+                                {"model_cycles": 2 + (index % 2)}
+                                if index == 0
+                                else {"turn_cycles": 2 + (index % 2)}
+                            ),
                             "tool_cycles": 3 + (index % 2),
                             "duration_ms": 20_000 + index * 1_000,
                         },
@@ -1174,11 +1426,16 @@ def test_successful_usage_distribution_calibrates_exact_versioned_route() -> Non
         assert measured["token_cap"] < base["token_cap"]
         assert measured["token_cap"] >= 28_000
         assert measured["model_cycle_cap"] >= 3
+        assert measured["turn_cycle_cap"] == measured["model_cycle_cap"]
         assert measured["tool_cycle_cap"] >= 4
+        assert measured["model_api_call_allowance"] == (
+            measured["tool_cycle_cap"] + 1
+        )
         assert measured["recommended_wall_time_seconds"] >= 24
         assert preserved["accepted_history"]["sample_count"] == 5
         assert preserved["token_cap"] >= 28_000
         assert preserved["model_cycle_cap"] >= 3
+        assert preserved["turn_cycle_cap"] == preserved["model_cycle_cap"]
         assert preserved["tool_cycle_cap"] >= 4
         assert preserved["recommended_wall_time_seconds"] >= 24
 
@@ -2754,6 +3011,9 @@ if __name__ == "__main__":
         test_t2_multifile_implementation_budget_is_token_efficient,
         test_bound_context_no_tools_budget_is_single_inference,
         test_reasoning_fragments_are_not_model_cycles_and_tools_are_independent,
+        test_turn_tool_and_model_api_call_accounting_are_independent,
+        test_usage_regression_and_late_wall_event_fail_closed,
+        test_calibration_failures_are_static_non_learning_regressions,
         test_successful_usage_distribution_calibrates_exact_versioned_route,
         test_budget_increase_requires_trusted_review_receipt,
         test_no_tools_contract_rejects_tool_items,

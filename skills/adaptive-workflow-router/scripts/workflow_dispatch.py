@@ -286,6 +286,13 @@ def _nearest_rank(values: list[int], percentile: float) -> int:
     return ordered[max(0, math.ceil(percentile * len(ordered)) - 1)]
 
 
+def model_api_call_allowance(tool_mode: str, tool_cycle_cap: int) -> int:
+    """Bound chargeable model calls independently from turns and tools."""
+    if tool_mode == "none":
+        return 1
+    return tool_cycle_cap + 1
+
+
 def load_execution_budget_policy() -> dict[str, Any]:
     policy = read_json(
         EXECUTION_BUDGET_POLICY.resolve(), "execution budget policy"
@@ -294,11 +301,12 @@ def load_execution_budget_policy() -> dict[str, Any]:
     weights = policy.get("model_resource_weights")
     unknown = policy.get("unknown_model_resource_weights")
     increase = policy.get("increase_contract")
+    cold_start = policy.get("cold_start_accounting")
     if (
         policy.get("schema_version") != 1
         or policy.get("policy_name")
         != "adaptive-workflow.execution-budget-policy"
-        or policy.get("policy_version") != 1
+        or policy.get("policy_version") != 2
         or not isinstance(history, dict)
         or type(history.get("minimum_samples")) is not int
         or history["minimum_samples"] < 1
@@ -320,6 +328,13 @@ def load_execution_budget_policy() -> dict[str, Any]:
         or not isinstance(weights, dict)
         or not isinstance(unknown, dict)
         or not isinstance(increase, dict)
+        or cold_start
+        != {
+            "tool_enabled_model_api_call_allowance": "tool_cycle_cap_plus_one",
+            "tool_mode_none_model_api_call_allowance": 1,
+            "context_growth_horizon": 2,
+            "work_allowance_scope": "phase_total",
+        }
         or increase.get("contract_name") != BUDGET_INCREASE_CONTRACT_NAME
         or increase.get("contract_version") != 1
         or increase.get("review_workflow_id") != "review.audit"
@@ -376,9 +391,10 @@ def accepted_usage_samples(
             or any(usage.get(field) != value for field, value in expected.items())
         ):
             continue
+        turn_cycles = usage.get("turn_cycles", usage.get("model_cycles"))
         measured = {
             "total_tokens": usage.get("total_tokens"),
-            "model_cycles": usage.get("model_cycles"),
+            "turn_cycles": turn_cycles,
             "tool_cycles": usage.get("tool_cycles"),
             "duration_ms": usage.get("duration_ms"),
         }
@@ -430,11 +446,11 @@ def apply_measured_success_envelope(
     weighted_headroom = 1.0 + (float(history["headroom"]) - 1.0) / weight
     observed = {
         field: _nearest_rank([sample[field] for sample in samples], percentile)
-        for field in ("total_tokens", "model_cycles", "tool_cycles", "duration_ms")
+        for field in ("total_tokens", "turn_cycles", "tool_cycles", "duration_ms")
     }
     measured_token_cap = math.ceil(observed["total_tokens"] * weighted_headroom)
     measured_model_cap = max(
-        1, math.ceil(observed["model_cycles"] * weighted_headroom)
+        1, math.ceil(observed["turn_cycles"] * weighted_headroom)
     )
     measured_tool_cap = (
         0
@@ -449,7 +465,11 @@ def apply_measured_success_envelope(
             "mode": "measured-success-envelope",
             "token_cap": measured_token_cap,
             "model_cycle_cap": measured_model_cap,
+            "turn_cycle_cap": measured_model_cap,
             "tool_cycle_cap": measured_tool_cap,
+            "model_api_call_allowance": model_api_call_allowance(
+                tool_mode, measured_tool_cap
+            ),
             "recommended_wall_time_seconds": measured_wall_cap,
             "accepted_history": {
                 **result["accepted_history"],
@@ -2221,15 +2241,20 @@ def derived_token_budget(
             "context_growth_per_inference": context_growth,
             "tier": resolution["tier"],
             "exact_output": False,
-            "efficiency_profile": "bounded-tool-loop-v2",
+            "efficiency_profile": "bounded-tool-loop-api-accounted-v2",
         }
-    per_inference_input = built_in_context_reserve + prompt_tokens_estimate
+    turn_cycle_cap = estimated_inferences
+    tool_cycle_cap = (
+        0 if exact_output is not None or tool_mode == "none" else turn_cycle_cap * 2
+    )
+    api_call_allowance = model_api_call_allowance(tool_mode, tool_cycle_cap)
+    per_api_call_input = built_in_context_reserve + prompt_tokens_estimate
     growth_total = 0
     if exact_output is None and tool_mode != "none":
         context_growth_horizon = 2
         growth_steps = sum(
             min(index, context_growth_horizon)
-            for index in range(estimated_inferences)
+            for index in range(api_call_allowance)
         )
         growth_total = round(
             context_growth
@@ -2238,18 +2263,17 @@ def derived_token_budget(
         )
         factors["context_growth_horizon"] = context_growth_horizon
     derived_cap = (
-        per_inference_input * estimated_inferences + growth_total + work_allowance
+        per_api_call_input * api_call_allowance + growth_total + work_allowance
     )
     derived_cap = ((derived_cap + 999) // 1_000) * 1_000
-    model_cycle_cap = estimated_inferences
-    tool_cycle_cap = (
-        0 if exact_output is not None or tool_mode == "none" else estimated_inferences * 2
-    )
     return {
         "mode": "derived",
+        "budget_formula_version": 2,
         "token_cap": derived_cap,
-        "model_cycle_cap": model_cycle_cap,
+        "model_cycle_cap": turn_cycle_cap,
+        "turn_cycle_cap": turn_cycle_cap,
         "tool_cycle_cap": tool_cycle_cap,
+        "model_api_call_allowance": api_call_allowance,
         "recommended_wall_time_seconds": {
             "T1": 300,
             "T2": 600,
@@ -2257,9 +2281,12 @@ def derived_token_budget(
             "T4": 1200,
         }[resolution["tier"]],
         "prompt_tokens_estimate": prompt_tokens_estimate,
+        "built_in_context_reserve_per_api_call": built_in_context_reserve,
         "built_in_context_reserve_per_inference": built_in_context_reserve,
         "estimated_inferences": estimated_inferences,
+        "estimated_turn_cycles": turn_cycle_cap,
         "estimated_context_growth_tokens": growth_total,
+        "estimated_bounded_replayed_growth_tokens": growth_total,
         "work_allowance": work_allowance,
         "factors": factors,
     }
@@ -2301,11 +2328,11 @@ def no_tools_item_violation(
 def observed_cycle_counts(
     events: list[dict[str, Any]], thread_id: str, turn_id: str
 ) -> dict[str, int]:
-    """Count harness-started model turns and tool calls as separate resources.
+    """Count harness-started turns and tool calls as separate resources.
 
     App Server may emit several ``reasoning`` items during one provider turn;
-    those items are not evidence of separate model invocations. The harness can
-    prove each ``turn/start`` it issued, so that is the model-cycle unit.
+    those items are not evidence of separate turns. The harness can prove each
+    ``turn/start`` it issued, so that is the compatibility ``model_cycles`` unit.
     """
     started_turn_ids: set[str] = set()
     tool_ids: set[str] = set()
@@ -2333,8 +2360,53 @@ def observed_cycle_counts(
             tool_ids.add(item_id)
     return {
         "model_cycles": len(started_turn_ids),
+        "turn_cycles": len(started_turn_ids),
         "tool_cycles": len(tool_ids),
     }
+
+
+def observed_model_api_call_updates(
+    events: list[dict[str, Any]], thread_id: str, turn_id: str
+) -> int:
+    """Count strictly advancing cumulative usage updates for the bound turn."""
+    count = 0
+    highest_total = -1
+    for event in events:
+        if event.get("method") != "thread/tokenUsage/updated" or not scoped_to_turn(
+            event, thread_id, turn_id
+        ):
+            continue
+        total_tokens = (
+            event.get("params", {})
+            .get("tokenUsage", {})
+            .get("total", {})
+            .get("totalTokens")
+        )
+        if type(total_tokens) is int and total_tokens > highest_total:
+            highest_total = total_tokens
+            count += 1
+    return count
+
+
+def scoped_usage_totals(
+    events: list[dict[str, Any]], thread_id: str, turn_id: str
+) -> list[int]:
+    """Return integer cumulative totals in retained event order."""
+    totals: list[int] = []
+    for event in events:
+        if event.get("method") != "thread/tokenUsage/updated" or not scoped_to_turn(
+            event, thread_id, turn_id
+        ):
+            continue
+        total_tokens = (
+            event.get("params", {})
+            .get("tokenUsage", {})
+            .get("total", {})
+            .get("totalTokens")
+        )
+        if type(total_tokens) is int:
+            totals.append(total_tokens)
+    return totals
 
 
 def validate_runtime_event_shapes(
@@ -2392,6 +2464,7 @@ def _runtime_record_unchecked(
     token_cap: int,
     model_cycle_cap: int | None = None,
     tool_cycle_cap: int | None = None,
+    model_api_call_allowance: int | None = None,
     tool_mode: str = "default",
     require_tool_use: bool = False,
 ) -> tuple[dict[str, Any], list[str]]:
@@ -2491,6 +2564,8 @@ def _runtime_record_unchecked(
     output_tokens = usage.get("outputTokens")
     total_tokens = usage.get("totalTokens")
     cycles = observed_cycle_counts(events, thread_id, turn_id)
+    api_call_updates = observed_model_api_call_updates(events, thread_id, turn_id)
+    usage_totals = scoped_usage_totals(events, thread_id, turn_id)
     turn_status = (
         completed[-1].get("params", {}).get("turn", {}).get("status")
         if completed
@@ -2551,15 +2626,25 @@ def _runtime_record_unchecked(
         issues.append("measured token usage is missing or invalid")
     elif total_tokens > token_cap:
         issues.append(f"token cap exceeded: {total_tokens} > {token_cap}")
+    if any(current < previous for previous, current in zip(usage_totals, usage_totals[1:])):
+        issues.append("thread-cumulative token usage moved backwards")
     if model_cycle_cap is not None and cycles["model_cycles"] > model_cycle_cap:
         issues.append(
-            "model cycle cap exceeded: "
+            "turn cycle cap exceeded: "
             f"{cycles['model_cycles']} > {model_cycle_cap}"
         )
     if tool_cycle_cap is not None and cycles["tool_cycles"] > tool_cycle_cap:
         issues.append(
             "tool cycle cap exceeded: "
             f"{cycles['tool_cycles']} > {tool_cycle_cap}"
+        )
+    if (
+        model_api_call_allowance is not None
+        and api_call_updates > model_api_call_allowance
+    ):
+        issues.append(
+            "model API-call allowance exceeded: "
+            f"{api_call_updates} > {model_api_call_allowance}"
         )
     if reroutes:
         issues.append("runtime reroute observed")
@@ -2591,6 +2676,7 @@ def _runtime_record_unchecked(
             "usage": {"input_tokens": input_tokens, "output_tokens": output_tokens},
             "total_tokens": total_tokens,
             **cycles,
+            "model_api_call_updates": api_call_updates,
             "reroutes": reroutes,
             "safety_buffering": safety,
             "tool_item_types": tool_item_types,
@@ -2609,6 +2695,7 @@ def runtime_record(
     token_cap: int,
     model_cycle_cap: int | None = None,
     tool_cycle_cap: int | None = None,
+    model_api_call_allowance: int | None = None,
     tool_mode: str = "default",
     require_tool_use: bool = False,
 ) -> tuple[dict[str, Any], list[str]]:
@@ -2622,6 +2709,7 @@ def runtime_record(
             token_cap=token_cap,
             model_cycle_cap=model_cycle_cap,
             tool_cycle_cap=tool_cycle_cap,
+            model_api_call_allowance=model_api_call_allowance,
             tool_mode=tool_mode,
             require_tool_use=require_tool_use,
         )
@@ -2648,6 +2736,7 @@ def interrupted_segment_record(
     turn_id: str,
     requested: dict[str, str],
     token_cap: int,
+    model_api_call_allowance: int = 1,
 ) -> tuple[dict[str, Any], list[str]]:
     runtime, issues = runtime_record(
         events,
@@ -2655,6 +2744,9 @@ def interrupted_segment_record(
         turn_id=turn_id,
         requested=requested,
         token_cap=token_cap,
+        model_cycle_cap=1,
+        tool_cycle_cap=0,
+        model_api_call_allowance=model_api_call_allowance,
         tool_mode="none",
     )
     issues = [issue for issue in issues if issue != "bound turn did not complete"]
@@ -2678,6 +2770,8 @@ def validate_checkpoint_runtime_state(
     final_usage: dict[str, int] | None = None
     final_events: list[dict[str, Any]] | None = None
     final_segment: dict[str, Any] | None = None
+    cumulative_api_call_updates = 0
+    turn_cycle_cap = resume_contract["max_continuations"] + 1
     for sequence, segment in enumerate(checkpoint["transcript_chain"], start=1):
         previous_timing_sha256, timing_cumulative_elapsed_ms = (
             validate_segment_timing(
@@ -2705,9 +2799,16 @@ def validate_checkpoint_runtime_state(
                 "retained thread-cumulative token usage moved backwards"
             )
         previous_total = runtime["total_tokens"]
+        cumulative_api_call_updates += runtime["model_api_call_updates"]
+        if sequence > turn_cycle_cap or cumulative_api_call_updates > turn_cycle_cap:
+            raise DispatchError("retained resume cycle allowance was exceeded")
         final_usage = {
             **runtime["usage"],
             "total_tokens": runtime["total_tokens"],
+            "model_cycles": sequence,
+            "turn_cycles": sequence,
+            "tool_cycles": 0,
+            "model_api_call_updates": cumulative_api_call_updates,
         }
         final_events = events
         final_segment = segment
@@ -2766,9 +2867,18 @@ def validate_checkpoint_runtime_state(
     cumulative_wall_time_ms = (
         resume_contract["cumulative_wall_time_seconds"] * 1000
     )
+    retained_usage = checkpoint.get("usage")
+    legacy_final_usage = (
+        {
+            key: final_usage[key]
+            for key in ("input_tokens", "output_tokens", "total_tokens")
+        }
+        if final_usage is not None
+        else None
+    )
     if (
         final_usage is None
-        or checkpoint.get("usage") != final_usage
+        or retained_usage not in (final_usage, legacy_final_usage)
         or type(elapsed_ms) is not int
         or elapsed_ms != timing_cumulative_elapsed_ms
         or not minimum_elapsed_ms <= elapsed_ms <= cumulative_wall_time_ms
@@ -2903,14 +3013,19 @@ class AppServer:
         self.process.stdin.flush()
 
     def next_event(self, deadline: float) -> dict[str, Any]:
-        while time.monotonic() < deadline:
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise AppServerDeadline("App Server event deadline elapsed")
             try:
-                line = self.stdout.get(timeout=0.25)
+                line = self.stdout.get(timeout=min(0.25, remaining))
             except queue.Empty:
                 if self.process.poll() is not None:
                     raise DispatchError(f"App Server exited {self.process.returncode}")
                 continue
             self._append_transcript(line)
+            if time.monotonic() > deadline:
+                raise AppServerDeadline("App Server event deadline elapsed")
             try:
                 event = json.loads(line)
             except json.JSONDecodeError as error:
@@ -2918,7 +3033,6 @@ class AppServer:
             if not isinstance(event, dict):
                 raise DispatchError("App Server emitted a non-object JSONL event")
             return event
-        raise AppServerDeadline("App Server event deadline elapsed")
 
     def wait_for(
         self, predicate: Callable[[dict[str, Any]], bool], deadline: float
@@ -3157,6 +3271,13 @@ def _run_resumable_phase(
     if not isinstance(resume_contract, dict):
         raise DispatchError("resumable execution omitted its bound authority")
     _, _, resume_policy = load_resumption_policy()
+    effective_limits = token_budget.get("effective_limits", {})
+    turn_cycle_cap = effective_limits.get(
+        "turn_cycle_cap", resume_contract["max_continuations"] + 1
+    )
+    api_call_allowance = effective_limits.get(
+        "model_api_call_allowance", resume_contract["max_continuations"] + 1
+    )
     work_manifest = resume_contract["work_manifest"]
     runner_version = subprocess.run(
         [str(runner), "--version"],
@@ -3211,6 +3332,10 @@ def _run_resumable_phase(
         if initial_checkpoint is not None
         else []
     )
+    cumulative_usage.setdefault("model_cycles", len(turn_ids))
+    cumulative_usage.setdefault("turn_cycles", len(turn_ids))
+    cumulative_usage.setdefault("tool_cycles", 0)
+    cumulative_usage.setdefault("model_api_call_updates", len(turn_ids))
 
     def abort(category: str, reasons: list[str]) -> int:
         completion_mode = (
@@ -3302,6 +3427,20 @@ def _run_resumable_phase(
             return abort(
                 "CONTINUATION_LIMIT",
                 ["bound continuation limit exhausted before completion"],
+            )
+        if len(turn_ids) >= turn_cycle_cap:
+            return abort(
+                "BUDGET_STOP",
+                [f"turn cycle cap exhausted: {len(turn_ids)} >= {turn_cycle_cap}"],
+            )
+        if cumulative_usage["model_api_call_updates"] >= api_call_allowance:
+            return abort(
+                "BUDGET_STOP",
+                [
+                    "model API-call allowance exhausted: "
+                    f"{cumulative_usage['model_api_call_updates']} "
+                    f">= {api_call_allowance}"
+                ],
             )
         if cumulative_usage["total_tokens"] >= token_cap:
             return abort(
@@ -3670,8 +3809,25 @@ def _run_resumable_phase(
 
         _fsync_file(transcript)
         events = transcript_events(transcript)
+        cumulative_api_call_updates = (
+            cumulative_usage["model_api_call_updates"]
+            + observed_model_api_call_updates(events, thread_id, turn_id)
+        )
+        if cumulative_api_call_updates > api_call_allowance:
+            live_failure = (
+                "model API-call allowance exceeded: "
+                f"{cumulative_api_call_updates} > {api_call_allowance}"
+            )
         segment_elapsed = int((time.monotonic() - segment_started) * 1000)
         cumulative_elapsed_ms += segment_elapsed
+        cumulative_wall_cap_ms = (
+            resume_contract["cumulative_wall_time_seconds"] * 1000
+        )
+        if cumulative_elapsed_ms > cumulative_wall_cap_ms:
+            live_failure = (
+                "wall-time cap exceeded: "
+                f"{cumulative_elapsed_ms} > {cumulative_wall_cap_ms}"
+            )
         turn_status = (
             terminal_event.get("params", {}).get("turn", {}).get("status")
             if terminal_event
@@ -3722,6 +3878,9 @@ def _run_resumable_phase(
                 turn_id=turn_id,
                 requested=requested,
                 token_cap=token_cap,
+                model_cycle_cap=1,
+                tool_cycle_cap=0,
+                model_api_call_allowance=1,
                 tool_mode="none",
             )
             if checkpoint_candidate is not None:
@@ -3754,7 +3913,9 @@ def _run_resumable_phase(
                 **runtime["usage"],
                 "total_tokens": runtime["total_tokens"],
                 "model_cycles": len(turn_ids),
+                "turn_cycles": len(turn_ids),
                 "tool_cycles": 0,
+                "model_api_call_updates": cumulative_api_call_updates,
             }
             completion_mode = (
                 "uninterrupted"
@@ -3801,6 +3962,10 @@ def _run_resumable_phase(
                 },
                 "limits": {
                     "token_cap": token_cap,
+                    "model_cycle_cap": turn_cycle_cap,
+                    "turn_cycle_cap": turn_cycle_cap,
+                    "tool_cycle_cap": 0,
+                    "model_api_call_allowance": api_call_allowance,
                     "token_budget": token_budget,
                     "cumulative_wall_time_seconds": resume_contract[
                         "cumulative_wall_time_seconds"
@@ -3855,8 +4020,11 @@ def _run_resumable_phase(
                         "effort": runtime["observed_effort"],
                         "tool_mode": "none",
                         "total_tokens": cumulative_usage["total_tokens"],
-                        "model_cycles": cumulative_usage["model_cycles"],
+                        "turn_cycles": cumulative_usage["turn_cycles"],
                         "tool_cycles": 0,
+                        "model_api_call_updates": cumulative_usage[
+                            "model_api_call_updates"
+                        ],
                         "duration_ms": cumulative_elapsed_ms,
                     },
                     "final_output_sha256": sha256_bytes(
@@ -3898,6 +4066,7 @@ def _run_resumable_phase(
             turn_id=turn_id,
             requested=requested,
             token_cap=token_cap,
+            model_api_call_allowance=1,
         )
         if checkpoint_candidate is None:
             issues = [
@@ -3915,6 +4084,10 @@ def _run_resumable_phase(
         cumulative_usage = {
             **runtime["usage"],
             "total_tokens": runtime["total_tokens"],
+            "model_cycles": len(turn_ids),
+            "turn_cycles": len(turn_ids),
+            "tool_cycles": 0,
+            "model_api_call_updates": cumulative_api_call_updates,
         }
         if checkpoint_candidate is None:
             return abort(
@@ -4171,9 +4344,23 @@ def run_phase(args: argparse.Namespace) -> int:
         "model_cycle_cap": cold_start_budget.get(
             "model_cycle_cap", estimated_inferences
         ),
+        "turn_cycle_cap": cold_start_budget.get(
+            "turn_cycle_cap",
+            cold_start_budget.get("model_cycle_cap", estimated_inferences),
+        ),
         "tool_cycle_cap": cold_start_budget.get(
             "tool_cycle_cap",
             0 if args.tool_mode == "none" else estimated_inferences * 2,
+        ),
+        "model_api_call_allowance": cold_start_budget.get(
+            "model_api_call_allowance",
+            model_api_call_allowance(
+                args.tool_mode,
+                cold_start_budget.get(
+                    "tool_cycle_cap",
+                    0 if args.tool_mode == "none" else estimated_inferences * 2,
+                ),
+            ),
         ),
         "recommended_wall_time_seconds": cold_start_budget.get(
             "recommended_wall_time_seconds", args.wall_time_seconds
@@ -4185,7 +4372,16 @@ def run_phase(args: argparse.Namespace) -> int:
     measured_limits = {
         "token_cap": token_budget["token_cap"],
         "model_cycle_cap": token_budget["model_cycle_cap"],
+        "turn_cycle_cap": token_budget.get(
+            "turn_cycle_cap", token_budget["model_cycle_cap"]
+        ),
         "tool_cycle_cap": token_budget["tool_cycle_cap"],
+        "model_api_call_allowance": token_budget.get(
+            "model_api_call_allowance",
+            model_api_call_allowance(
+                args.tool_mode, token_budget["tool_cycle_cap"]
+            ),
+        ),
         "wall_time_seconds": min(
             args.wall_time_seconds,
             token_budget["recommended_wall_time_seconds"],
@@ -4202,6 +4398,11 @@ def run_phase(args: argparse.Namespace) -> int:
             if requested_model_cycle_cap is not None
             else measured_limits["model_cycle_cap"]
         ),
+        "turn_cycle_cap": (
+            requested_model_cycle_cap
+            if requested_model_cycle_cap is not None
+            else measured_limits["turn_cycle_cap"]
+        ),
         "tool_cycle_cap": (
             requested_tool_cycle_cap
             if requested_tool_cycle_cap is not None
@@ -4213,6 +4414,16 @@ def run_phase(args: argparse.Namespace) -> int:
             else measured_limits["wall_time_seconds"]
         ),
     }
+    requested_limits["model_api_call_allowance"] = model_api_call_allowance(
+        args.tool_mode, requested_limits["tool_cycle_cap"]
+    )
+    if resume_contract is not None:
+        resumable_turn_cap = resume_contract["max_continuations"] + 1
+        for limits in (measured_limits, requested_limits):
+            limits["model_cycle_cap"] = resumable_turn_cap
+            limits["turn_cycle_cap"] = resumable_turn_cap
+            limits["tool_cycle_cap"] = 0
+            limits["model_api_call_allowance"] = resumable_turn_cap
     if args.tool_mode == "none" and requested_limits["tool_cycle_cap"] != 0:
         raise DispatchError("a no-tools phase must have a zero tool-cycle cap")
     increased = any(
@@ -4246,7 +4457,11 @@ def run_phase(args: argparse.Namespace) -> int:
         "cold_start_limits": {
             "token_cap": cold_start_budget["token_cap"],
             "model_cycle_cap": cold_start_budget["model_cycle_cap"],
+            "turn_cycle_cap": cold_start_budget["turn_cycle_cap"],
             "tool_cycle_cap": cold_start_budget["tool_cycle_cap"],
+            "model_api_call_allowance": cold_start_budget[
+                "model_api_call_allowance"
+            ],
             "wall_time_seconds": cold_start_budget[
                 "recommended_wall_time_seconds"
             ],
@@ -4259,6 +4474,7 @@ def run_phase(args: argparse.Namespace) -> int:
     token_cap = requested_limits["token_cap"]
     model_cycle_cap = requested_limits["model_cycle_cap"]
     tool_cycle_cap = requested_limits["tool_cycle_cap"]
+    api_call_allowance = requested_limits["model_api_call_allowance"]
     effective_wall_time_seconds = requested_limits["wall_time_seconds"]
     initial_checkpoint_path = getattr(args, "resume_checkpoint", None)
     initial_checkpoint: dict[str, Any] | None = None
@@ -4407,9 +4623,11 @@ def run_phase(args: argparse.Namespace) -> int:
             profile["developer_instructions"].strip()
             + "\n\nThis route is bound to the supplied phase only. Do not spawn agents. "
             "Do not claim external authority. Stop and report any required scope expansion. "
-            f"The derived phase budget allows about {token_budget['estimated_inferences']} "
-            f"model inferences, at most {model_cycle_cap} observed model cycles, "
-            f"at most {tool_cycle_cap} tool cycles, {token_cap} total tokens, and "
+            f"The derived phase budget allows at most {model_cycle_cap} "
+            f"harness-started turn cycles, at most {tool_cycle_cap} tool cycles, "
+            f"and at most {api_call_allowance} chargeable model API calls "
+            "(the initial call plus follow-up calls after tool results), "
+            f"with {token_cap} total tokens and "
             f"{effective_wall_time_seconds} seconds; minimize redundant tool loops."
         )
         if args.tool_mode == "none":
@@ -4471,8 +4689,10 @@ def run_phase(args: argparse.Namespace) -> int:
         interrupted = False
         # One ordinary dispatch owns exactly one harness-started model turn.
         # Reasoning items may fragment within it and are not separate cycles.
-        observed_model_cycle_ids: set[str] = {turn_id}
+        observed_turn_cycle_ids: set[str] = {turn_id}
         observed_tool_cycle_ids: set[str] = set()
+        observed_api_call_updates = 0
+        highest_usage_total = -1
         while True:
             event = server.next_event(deadline)
             if event.get("method") == "item/started" and scoped_to_turn(
@@ -4485,12 +4705,12 @@ def run_phase(args: argparse.Namespace) -> int:
                     if item_type not in NO_TOOLS_PASSIVE_ITEM_TYPES:
                         observed_tool_cycle_ids.add(item_id)
                 if (
-                    len(observed_model_cycle_ids) > model_cycle_cap
+                    len(observed_turn_cycle_ids) > model_cycle_cap
                     and not interrupted
                 ):
                     cap_interrupt_reason = (
-                        "model cycle cap exceeded: "
-                        f"{len(observed_model_cycle_ids)} > {model_cycle_cap}"
+                        "turn cycle cap exceeded: "
+                        f"{len(observed_turn_cycle_ids)} > {model_cycle_cap}"
                     )
                     server.send(
                         {
@@ -4545,6 +4765,25 @@ def run_phase(args: argparse.Namespace) -> int:
                     .get("total", {})
                     .get("totalTokens")
                 )
+                if type(measured) is int and measured > highest_usage_total:
+                    highest_usage_total = measured
+                    observed_api_call_updates += 1
+                if (
+                    observed_api_call_updates > api_call_allowance
+                    and not interrupted
+                ):
+                    cap_interrupt_reason = (
+                        "model API-call allowance exceeded: "
+                        f"{observed_api_call_updates} > {api_call_allowance}"
+                    )
+                    server.send(
+                        {
+                            "id": 4,
+                            "method": "turn/interrupt",
+                            "params": {"threadId": thread_id, "turnId": turn_id},
+                        }
+                    )
+                    interrupted = True
                 if type(measured) is int and measured > token_cap and not interrupted:
                     cap_interrupt_reason = f"token cap exceeded: {measured} > {token_cap}"
                     server.send(
@@ -4602,6 +4841,7 @@ def run_phase(args: argparse.Namespace) -> int:
             token_cap=token_cap,
             model_cycle_cap=model_cycle_cap,
             tool_cycle_cap=tool_cycle_cap,
+            model_api_call_allowance=api_call_allowance,
             tool_mode=args.tool_mode,
             require_tool_use=(
                 request.get("mutation") != "none"
@@ -4633,6 +4873,12 @@ def run_phase(args: argparse.Namespace) -> int:
         and (runtime.get("output_text") or "").strip() != args.expect_exact_output
     ):
         issues.append("final output did not match the deterministic smoke expectation")
+    elapsed_ms = int((time.monotonic() - started_at) * 1000)
+    if elapsed_ms > effective_wall_time_seconds * 1000:
+        issues.append(
+            "wall-time cap exceeded: "
+            f"{elapsed_ms} > {effective_wall_time_seconds * 1000}"
+        )
     transcript_hash = sha256_bytes(transcript.read_bytes())
     version = subprocess.run(
         [str(runner), "--version"],
@@ -4663,11 +4909,13 @@ def run_phase(args: argparse.Namespace) -> int:
         "limits": {
             "token_cap": token_cap,
             "model_cycle_cap": model_cycle_cap,
+            "turn_cycle_cap": model_cycle_cap,
             "tool_cycle_cap": tool_cycle_cap,
+            "model_api_call_allowance": api_call_allowance,
             "token_budget": token_budget,
             "wall_time_seconds": effective_wall_time_seconds,
             "requested_wall_time_ceiling_seconds": args.wall_time_seconds,
-            "elapsed_ms": int((time.monotonic() - started_at) * 1000),
+            "elapsed_ms": elapsed_ms,
         },
         "issues": issues,
     }
@@ -4730,7 +4978,11 @@ def run_phase(args: argparse.Namespace) -> int:
                         **runtime["usage"],
                         "total_tokens": runtime["total_tokens"],
                         "model_cycles": runtime["model_cycles"],
+                        "turn_cycles": runtime["turn_cycles"],
                         "tool_cycles": runtime["tool_cycles"],
+                        "model_api_call_updates": runtime[
+                            "model_api_call_updates"
+                        ],
                     },
                     "duration_ms": duration_ms,
                     "accepted_usage": {
@@ -4742,8 +4994,11 @@ def run_phase(args: argparse.Namespace) -> int:
                         "effort": runtime["observed_effort"],
                         "tool_mode": args.tool_mode,
                         "total_tokens": runtime["total_tokens"],
-                        "model_cycles": runtime["model_cycles"],
+                        "turn_cycles": runtime["turn_cycles"],
                         "tool_cycles": runtime["tool_cycles"],
+                        "model_api_call_updates": runtime[
+                            "model_api_call_updates"
+                        ],
                         "duration_ms": duration_ms,
                     },
                     "final_output_sha256": sha256_bytes(
