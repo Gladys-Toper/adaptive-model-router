@@ -69,6 +69,9 @@ ACTIVE_PREPROMOTION_STATUSES = {
     "blocked_model_enforcement",
     "qualified",
 }
+FAMILY_OBSERVABILITY_REBASELINE_FIELDS = frozenset(
+    {"instruction_hash", "supports_reasoning_summaries"}
+)
 
 TIER_INDEX = {"T0": 0, "T1": 1, "T2": 2, "T3": 3, "T4": 4}
 INDEX_TIER = {value: key for key, value in TIER_INDEX.items()}
@@ -145,6 +148,11 @@ RISK_TAG_FLOORS = {
 
 class RouterLabError(RuntimeError):
     pass
+
+
+def is_daybreak_model(model_slug: str) -> bool:
+    """Keep the security-specialist candidate outside automatic general routing."""
+    return "daybreak" in model_slug.lower()
 
 
 def isolated_test_context() -> bool:
@@ -1177,6 +1185,58 @@ def normalized_execution_route(
     }
 
 
+def is_family_observability_contract_rebaseline(
+    policy: dict[str, Any],
+    previous: dict[str, Any] | None,
+    current: dict[str, Any],
+    changes: dict[str, Any],
+) -> bool:
+    """Recognize one uniform active-family client observability transition."""
+    if previous is None:
+        return False
+    active_slugs = {policy["tiers"][tier]["model"] for tier in VALID_TIERS}
+    details = changes.get("change_details", {})
+    semantic_changed = set(changes.get("semantic_changed", []))
+    if not active_slugs or not active_slugs <= semantic_changed:
+        return False
+
+    transitions: set[tuple[Any, ...]] = set()
+    for slug in active_slugs:
+        detail = details.get(slug, {})
+        if set(detail.get("changed_fields", [])) != FAMILY_OBSERVABILITY_REBASELINE_FIELDS:
+            return False
+        old_model = previous.get("models", {}).get(slug)
+        new_model = current.get("models", {}).get(slug)
+        if not isinstance(old_model, dict) or not isinstance(new_model, dict):
+            return False
+        old_summary = old_model.get("supports_reasoning_summaries")
+        new_summary = new_model.get("supports_reasoning_summaries")
+        if type(old_summary) is not bool or type(new_summary) is not bool:
+            return False
+        transitions.add(
+            (
+                old_model.get("instruction_hash"),
+                new_model.get("instruction_hash"),
+                old_summary,
+                new_summary,
+            )
+        )
+    if len(transitions) != 1:
+        return False
+
+    for tier in VALID_TIERS:
+        assignment = policy["tiers"][tier]
+        model = current.get("models", {}).get(assignment["model"])
+        if model is None:
+            return False
+        eligible, _ = active_route_eligibility(
+            policy, current, model, tier, assignment["effort"]
+        )
+        if not eligible:
+            return False
+    return True
+
+
 def active_revision_transition_plan(
     policy: dict[str, Any],
     previous: dict[str, Any] | None,
@@ -1188,10 +1248,48 @@ def active_revision_transition_plan(
     instruction_only = set(changes.get("instruction_only", []))
     semantic_changed = set(changes.get("semantic_changed", []))
     details = changes.get("change_details", {})
+    family_observability_rebaseline = is_family_observability_contract_rebaseline(
+        policy, previous, current, changes
+    )
     for tier in VALID_TIERS:
         assignment = policy["tiers"][tier]
         slug = assignment["model"]
         if slug in semantic_changed:
+            detail = details.get(slug, {})
+            if (
+                family_observability_rebaseline
+                and set(detail.get("changed_fields", []))
+                == FAMILY_OBSERVABILITY_REBASELINE_FIELDS
+            ):
+                old_model = previous["models"][slug] if previous is not None else {}
+                new_model = current["models"][slug]
+                route = normalized_execution_route(
+                    policy, current, tier, slug, assignment["effort"]
+                )
+                rebaselines.append(
+                    {
+                        "tier": tier,
+                        "provider": route["provider"],
+                        "model": slug,
+                        "effort": assignment["effort"],
+                        "service_tier": route["service_tier"],
+                        "changed_fields": sorted(
+                            FAMILY_OBSERVABILITY_REBASELINE_FIELDS
+                        ),
+                        "old_instruction_hash": old_model.get("instruction_hash"),
+                        "new_instruction_hash": new_model.get("instruction_hash"),
+                        "old_supports_reasoning_summaries": old_model.get(
+                            "supports_reasoning_summaries"
+                        ),
+                        "new_supports_reasoning_summaries": new_model.get(
+                            "supports_reasoning_summaries"
+                        ),
+                        "old_revision_hash": detail.get("old_revision_hash"),
+                        "new_revision_hash": detail.get("new_revision_hash"),
+                        "reason": "active-family-observability-contract-rebaseline",
+                    }
+                )
+                continue
             force_fallback_tiers.add(tier)
             continue
         if slug not in instruction_only:
@@ -1846,11 +1944,18 @@ def stage_candidate_internal(
     tier: str,
     *,
     trigger: str,
+    security_candidate: bool = False,
     restart_of: str | None = None,
     restart_sequence: int | None = None,
 ) -> dict[str, Any] | None:
     if tier not in VALID_TIERS:
         raise RouterLabError(f"invalid tier: {tier}")
+    if is_daybreak_model(model_slug) and (
+        not security_candidate or tier != "T3" or trigger == "catalog-change"
+    ):
+        raise RouterLabError(
+            "daybreak is permitted only as an explicit bounded T3 security candidate"
+        )
     model = catalog.get("models", {}).get(model_slug)
     if model is None:
         raise RouterLabError(f"model is not in the local catalog: {model_slug}")
@@ -1978,6 +2083,7 @@ def stage_candidate_internal(
         "status": "staged",
         "staged_at": utc_now(),
         "trigger": trigger,
+        "security_candidate": security_candidate,
         **material,
         "candidate_agent": agent_name,
         "candidate_profile_file": profile_name,
@@ -2397,6 +2503,8 @@ def refresh_catalog(stage_new: bool) -> dict[str, Any]:
                 + changes["semantic_changed"]
                 + changes["instruction_only"]
             ):
+                if is_daybreak_model(slug):
+                    continue
                 for tier in VALID_TIERS:
                     model = current["models"][slug]
                     eligible, _ = tier_eligibility(policy, current, model, tier)
@@ -2473,7 +2581,9 @@ def refresh_catalog(stage_new: bool) -> dict[str, Any]:
     }
 
 
-def stage_candidate(model: str, tier: str) -> dict[str, Any]:
+def stage_candidate(
+    model: str, tier: str, *, security_candidate: bool = False
+) -> dict[str, Any]:
     if not CATALOG_PATH.exists():
         refresh_catalog(stage_new=False)
     catalog = read_json(CATALOG_PATH)
@@ -2483,7 +2593,13 @@ def stage_candidate(model: str, tier: str) -> dict[str, Any]:
     policy = load_policy()
     candidates = load_candidates()
     item = stage_candidate_internal(
-        candidates, catalog, policy, model, tier, trigger="explicit-reoptimization"
+        candidates,
+        catalog,
+        policy,
+        model,
+        tier,
+        trigger="explicit-reoptimization",
+        security_candidate=security_candidate,
     )
     atomic_write_json(CANDIDATES_PATH, candidates)
     return item or {"status": "already-active", "tier": tier, "model": model}
@@ -2523,6 +2639,7 @@ def restart_candidate(candidate_id: str, reason: str) -> dict[str, Any]:
         candidate["candidate_model"],
         candidate["tier"],
         trigger="experiment-restart",
+        security_candidate=bool(candidate.get("security_candidate")),
         restart_of=candidate_id,
         restart_sequence=sequence,
     )
@@ -3774,6 +3891,10 @@ def promote_candidate_internal(
     policy: dict[str, Any],
     catalog: dict[str, Any],
 ) -> None:
+    if is_daybreak_model(str(candidate.get("candidate_model", ""))):
+        raise RouterLabError(
+            "daybreak security candidates are evaluation-only and cannot become an active general route"
+        )
     if candidate.get("status") != "qualified":
         raise RouterLabError("candidate is not qualified")
     if any(
@@ -4894,6 +5015,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     stage.add_argument("--model", required=True)
     stage.add_argument("--tier", required=True, choices=VALID_TIERS)
+    stage.add_argument(
+        "--security-candidate",
+        action="store_true",
+        help="Permit the bounded, evaluation-only Daybreak T3 security lane",
+    )
 
     restart = subparsers.add_parser(
         "restart", help="Supersede a contaminated experiment with a clean candidate ID."
@@ -5034,7 +5160,9 @@ def main() -> int:
             if args.command == "refresh":
                 result = refresh_catalog(args.stage_new)
             elif args.command == "stage":
-                result = stage_candidate(args.model, args.tier)
+                result = stage_candidate(
+                    args.model, args.tier, security_candidate=args.security_candidate
+                )
             elif args.command == "restart":
                 result = restart_candidate(args.candidate_id, args.reason)
             elif args.command == "record":

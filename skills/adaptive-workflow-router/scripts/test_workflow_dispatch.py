@@ -9,6 +9,7 @@ import contextlib
 import importlib.util
 import io
 import json
+import multiprocessing
 import os
 import sys
 import tempfile
@@ -174,6 +175,54 @@ def patched_dispatch(**replacements: Any) -> Iterator[None]:
     finally:
         for name, value in originals.items():
             setattr(DISPATCH, name, value)
+
+
+def allocate_run_directory_in_process(
+    run_root: str,
+    canonical_name: str,
+    start: Any,
+    results: Any,
+) -> None:
+    start.wait()
+    allocated = DISPATCH.allocate_run_directory(
+        Path(run_root), canonical_name, mode=0o755
+    )
+    results.put(allocated.name)
+
+
+def test_allocate_run_directory_is_unique_across_same_second_processes() -> None:
+    allocations = 8
+    timestamp = "20260811T212146Z"
+    phase = "inspect"
+    canonical_name = f"{timestamp}-{phase}"
+    with tempfile.TemporaryDirectory(prefix="workflow-run-allocation-") as temporary:
+        run_root = Path(temporary) / "runs"
+        context = multiprocessing.get_context("fork")
+        start = context.Event()
+        results = context.Queue()
+        processes = [
+            context.Process(
+                target=allocate_run_directory_in_process,
+                args=(str(run_root), canonical_name, start, results),
+            )
+            for _ in range(allocations)
+        ]
+        for process in processes:
+            process.start()
+        start.set()
+        names = {results.get(timeout=10) for _ in processes}
+        for process in processes:
+            process.join(timeout=10)
+            assert process.exitcode == 0
+        expected = {
+            canonical_name,
+            *(
+                f"{canonical_name}-{suffix:04d}"
+                for suffix in range(1, allocations)
+            ),
+        }
+        assert names == expected
+        assert all((run_root / name).is_dir() for name in names)
 
 
 def retained_execution_payload(root: Path, output_text: str = "done") -> dict:
@@ -949,6 +998,24 @@ def test_token_budget_is_derived_from_phase_requirements() -> None:
     assert complex_budget["factors"]["scope"] > local_budget["factors"]["scope"]
 
 
+def test_t2_multifile_implementation_budget_is_token_efficient() -> None:
+    request = {
+        **DISPATCH.smoke_request("T2"),
+        "activity": "implement",
+        "scope": "multi_file",
+        "ambiguity": "bounded",
+    }
+    budget = DISPATCH.derived_token_budget(
+        request,
+        {"tier": "T2"},
+        "Implement the supplied bounded patch contract.",
+        exact_output=None,
+    )
+    assert budget["estimated_inferences"] == 3
+    assert budget["token_cap"] <= 110_000
+    assert budget["factors"]["efficiency_profile"] == "bounded-tool-loop-v2"
+
+
 def test_bound_context_no_tools_budget_is_single_inference() -> None:
     request = DISPATCH.smoke_request("T3")
     budget = DISPATCH.derived_token_budget(
@@ -960,6 +1027,278 @@ def test_bound_context_no_tools_budget_is_single_inference() -> None:
     )
     assert budget["estimated_inferences"] == 1
     assert budget["estimated_context_growth_tokens"] == 0
+
+
+def test_reasoning_fragments_are_not_model_cycles_and_tools_are_independent() -> None:
+    values = events()
+    values[1:1] = [
+        {
+            "method": "item/started",
+            "params": {
+                "threadId": THREAD,
+                "turnId": TURN,
+                "item": {"type": "reasoning", "id": "reasoning-1"},
+            },
+        },
+        {
+            "method": "item/started",
+            "params": {
+                "threadId": THREAD,
+                "turnId": TURN,
+                "item": {"type": "reasoning", "id": "reasoning-2"},
+            },
+        },
+        {
+            "method": "item/started",
+            "params": {
+                "threadId": THREAD,
+                "turnId": TURN,
+                "item": {"type": "commandExecution", "id": "tool-1"},
+            },
+        },
+    ]
+    record, issues = DISPATCH.runtime_record(
+        values,
+        thread_id=THREAD,
+        turn_id=TURN,
+        requested=REQUESTED,
+        token_cap=200,
+        model_cycle_cap=1,
+        tool_cycle_cap=1,
+    )
+    assert record["model_cycles"] == 1
+    assert record["tool_cycles"] == 1
+    assert not any("model cycle cap exceeded" in issue for issue in issues)
+    assert not any("tool cycle cap exceeded" in issue for issue in issues)
+    assert DISPATCH.execution_status(issues) == "COMPLETED"
+
+
+def test_successful_usage_distribution_calibrates_exact_versioned_route() -> None:
+    with tempfile.TemporaryDirectory(prefix="workflow-measured-budget-") as temporary:
+        root = Path(temporary)
+        request = {
+            **DISPATCH.smoke_request("T2"),
+            "workflow_id": "coding.change",
+            "phase_id": "implement",
+        }
+        resolution = {
+            "tier": "T2",
+            "model": "gpt-5.6-terra",
+            "effort": "medium",
+        }
+        base = DISPATCH.derived_token_budget(
+            request,
+            resolution,
+            "Implement the bounded change.",
+            exact_output=None,
+        )
+        with isolated_registry(root / "registry") as registry:
+            for index, total in enumerate((20_000, 22_000, 24_000, 26_000, 28_000)):
+                DISPATCH.append_execution_receipt(
+                    {
+                        "status": "COMPLETED",
+                        "accepted_usage": {
+                            "workflow_id": "coding.change",
+                            "workflow_version": 1,
+                            "phase_id": "implement",
+                            "activity": "implement",
+                            "model": "gpt-5.6-terra",
+                            "effort": "medium",
+                            "tool_mode": "default",
+                            "total_tokens": total,
+                            "model_cycles": 2 + (index % 2),
+                            "tool_cycles": 3 + (index % 2),
+                            "duration_ms": 20_000 + index * 1_000,
+                        },
+                    }
+                )
+            DISPATCH.append_execution_receipt(
+                {
+                    "status": "COMPLETED",
+                    "accepted_usage": {
+                        "workflow_id": "coding.change",
+                        "workflow_version": 2,
+                        "phase_id": "implement",
+                        "activity": "implement",
+                        "model": "gpt-5.6-terra",
+                        "effort": "medium",
+                        "tool_mode": "default",
+                        "total_tokens": 800_000,
+                        "model_cycles": 15,
+                        "tool_cycles": 30,
+                        "duration_ms": 800_000,
+                    },
+                }
+            )
+            DISPATCH.append_execution_receipt(
+                {
+                    "status": "COMPLETED",
+                    "accepted_usage": {
+                        "workflow_id": "coding.change",
+                        "workflow_version": 1,
+                        "phase_id": "implement",
+                        "activity": "implement",
+                        "model": "gpt-5.6-sol",
+                        "effort": "medium",
+                        "tool_mode": "default",
+                        "total_tokens": 900_000,
+                        "model_cycles": 20,
+                        "tool_cycles": 40,
+                        "duration_ms": 900_000,
+                    },
+                }
+            )
+            measured = DISPATCH.apply_measured_success_envelope(
+                base,
+                request,
+                resolution,
+                "default",
+                registry_path=registry,
+            )
+            lower_formula = {
+                **base,
+                "token_cap": 25_000,
+                "model_cycle_cap": 1,
+                "tool_cycle_cap": 2,
+                "recommended_wall_time_seconds": 10,
+            }
+            preserved = DISPATCH.apply_measured_success_envelope(
+                lower_formula,
+                request,
+                resolution,
+                "default",
+                registry_path=registry,
+            )
+        assert measured["mode"] == "measured-success-envelope"
+        assert measured["accepted_history"]["sample_count"] == 5
+        assert measured["token_cap"] < base["token_cap"]
+        assert measured["token_cap"] >= 28_000
+        assert measured["model_cycle_cap"] >= 3
+        assert measured["tool_cycle_cap"] >= 4
+        assert measured["recommended_wall_time_seconds"] >= 24
+        assert preserved["accepted_history"]["sample_count"] == 5
+        assert preserved["token_cap"] >= 28_000
+        assert preserved["model_cycle_cap"] >= 3
+        assert preserved["tool_cycle_cap"] >= 4
+        assert preserved["recommended_wall_time_seconds"] >= 24
+
+
+def test_budget_increase_requires_trusted_review_receipt() -> None:
+    with tempfile.TemporaryDirectory(prefix="workflow-budget-increase-") as temporary:
+        root = Path(temporary)
+        evidence = root / "measured-envelope.json"
+        evidence.write_text('{"samples":5}\n', encoding="utf-8")
+        binding = {"phase": "coding.change:implement", "prompt": "a" * 64}
+        measured = {
+            "token_cap": 30_000,
+            "model_cycle_cap": 2,
+            "tool_cycle_cap": 4,
+            "wall_time_seconds": 60,
+        }
+        requested = {**measured, "token_cap": 45_000}
+        with isolated_registry(root / "registry") as registry:
+            rationale = (
+                "The retained accepted-task evidence proves the larger bounded case."
+            )
+            proposal = DISPATCH.budget_increase_review_proposal(
+                task_binding_sha256=DISPATCH.content_hash(binding),
+                measured_limits=measured,
+                requested_limits=requested,
+                evidence_sha256=DISPATCH.sha256_bytes(evidence.read_bytes()),
+                rationale=rationale,
+            )
+            approval = (
+                f"APPROVE {DISPATCH.BUDGET_INCREASE_CONTRACT_NAME} "
+                f"{proposal['proposal_sha256']}"
+            )
+            review_metadata_path = root / "review-metadata.json"
+            DISPATCH.write_json(
+                review_metadata_path,
+                {
+                    "status": "COMPLETED",
+                    "server": {"output_text": approval},
+                },
+            )
+            review = DISPATCH.append_execution_receipt(
+                {
+                    "status": "COMPLETED",
+                    "metadata_path": str(review_metadata_path.resolve()),
+                    "metadata_sha256": DISPATCH.sha256_bytes(
+                        review_metadata_path.read_bytes()
+                    ),
+                    "final_output_sha256": DISPATCH.sha256_bytes(
+                        approval.encode("utf-8")
+                    ),
+                    "accepted_usage": {
+                        "workflow_id": "review.audit",
+                        "workflow_version": 1,
+                        "phase_id": "adjudicate",
+                        "activity": "adjudicate",
+                        "model": "gpt-5.6-terra",
+                        "effort": "high",
+                        "tool_mode": "none",
+                        "total_tokens": 1_000,
+                        "model_cycles": 1,
+                        "tool_cycles": 0,
+                        "duration_ms": 1_000,
+                    },
+                }
+            )
+            identity = {
+                "schema_version": 1,
+                "contract_name": DISPATCH.BUDGET_INCREASE_CONTRACT_NAME,
+                "contract_version": 1,
+                "task_binding_sha256": DISPATCH.content_hash(binding),
+                "measured_limits": measured,
+                "requested_limits": requested,
+                "review_execution_receipt_id": review["receipt_id"],
+                "review_proposal_sha256": proposal["proposal_sha256"],
+                "evidence_path": str(evidence.resolve()),
+                "evidence_sha256": DISPATCH.sha256_bytes(evidence.read_bytes()),
+                "rationale": rationale,
+            }
+            contract = {**identity, "contract_sha256": DISPATCH.content_hash(identity)}
+            contract_path = root / "increase.json"
+            DISPATCH.write_json(contract_path, contract)
+            accepted = DISPATCH.validate_budget_increase_contract(
+                contract_path,
+                task_binding=binding,
+                measured_limits=measured,
+                requested_limits=requested,
+                registry_path=registry,
+            )
+            unrelated_requested = {**requested, "token_cap": 50_000}
+            unrelated_proposal = DISPATCH.budget_increase_review_proposal(
+                task_binding_sha256=DISPATCH.content_hash(binding),
+                measured_limits=measured,
+                requested_limits=unrelated_requested,
+                evidence_sha256=DISPATCH.sha256_bytes(evidence.read_bytes()),
+                rationale=rationale,
+            )
+            unrelated_identity = {
+                **identity,
+                "requested_limits": unrelated_requested,
+                "review_proposal_sha256": unrelated_proposal["proposal_sha256"],
+            }
+            unrelated_contract = {
+                **unrelated_identity,
+                "contract_sha256": DISPATCH.content_hash(unrelated_identity),
+            }
+            unrelated_path = root / "unrelated-increase.json"
+            DISPATCH.write_json(unrelated_path, unrelated_contract)
+            try:
+                DISPATCH.validate_budget_increase_contract(
+                    unrelated_path,
+                    task_binding=binding,
+                    measured_limits=measured,
+                    requested_limits=unrelated_requested,
+                    registry_path=registry,
+                )
+            except DISPATCH.DispatchError as error:
+                assert "does not approve" in str(error)
+            else:
+                raise AssertionError("an unrelated review receipt approved a new increase")
+        assert accepted["review_execution_receipt_id"] == review["receipt_id"]
 
 
 def test_no_tools_contract_rejects_tool_items() -> None:
@@ -2393,6 +2732,7 @@ def test_blind_quality_is_bound_to_registered_grader_output() -> None:
 if __name__ == "__main__":
     tests = (
         test_install_journal_blocks_execution_except_bound_verifier,
+        test_allocate_run_directory_is_unique_across_same_second_processes,
         test_exact_metadata_is_accepted,
         test_explicit_checkpoint_envelope_is_strict_and_reasoning_never_qualifies,
         test_resume_checkpoint_is_atomic_private_self_hashed_and_single_use,
@@ -2411,7 +2751,11 @@ if __name__ == "__main__":
         test_catalog_staleness_does_not_disable_healthy_routing,
         test_unrestricted_worker_sandbox_is_rejected,
         test_token_budget_is_derived_from_phase_requirements,
+        test_t2_multifile_implementation_budget_is_token_efficient,
         test_bound_context_no_tools_budget_is_single_inference,
+        test_reasoning_fragments_are_not_model_cycles_and_tools_are_independent,
+        test_successful_usage_distribution_calibrates_exact_versioned_route,
+        test_budget_increase_requires_trusted_review_receipt,
         test_no_tools_contract_rejects_tool_items,
         test_historical_mutating_transcripts_require_observed_tool_use,
         test_workspace_write_instructions_identify_local_execution_bridge,
