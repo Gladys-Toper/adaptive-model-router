@@ -1736,7 +1736,7 @@ def test_capacity_snapshot_is_dispatcher_derived() -> None:
     expected_available = min(
         snapshot["provider_weight_ceiling"],
         max(
-            1.0,
+            DISPATCH.governance._direct_resource_weight(),
             snapshot["host_logical_cpus"]
             / snapshot["host_logical_cpus_per_weight_unit"],
         ),
