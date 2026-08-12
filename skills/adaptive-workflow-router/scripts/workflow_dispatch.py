@@ -290,7 +290,7 @@ def model_api_call_allowance(tool_mode: str, tool_cycle_cap: int) -> int:
     """Bound chargeable model calls independently from turns and tools."""
     if tool_mode == "none":
         return 1
-    return tool_cycle_cap + 1
+    return tool_cycle_cap + 2
 
 
 def load_execution_budget_policy() -> dict[str, Any]:
@@ -306,7 +306,7 @@ def load_execution_budget_policy() -> dict[str, Any]:
         policy.get("schema_version") != 1
         or policy.get("policy_name")
         != "adaptive-workflow.execution-budget-policy"
-        or policy.get("policy_version") != 2
+        or policy.get("policy_version") != 3
         or not isinstance(history, dict)
         or type(history.get("minimum_samples")) is not int
         or history["minimum_samples"] < 1
@@ -330,10 +330,11 @@ def load_execution_budget_policy() -> dict[str, Any]:
         or not isinstance(increase, dict)
         or cold_start
         != {
-            "tool_enabled_model_api_call_allowance": "tool_cycle_cap_plus_one",
+            "tool_enabled_model_api_call_allowance": "tool_cycle_cap_plus_two",
             "tool_mode_none_model_api_call_allowance": 1,
             "context_growth_horizon": 2,
             "work_allowance_scope": "phase_total",
+            "unobserved_provider_call_behavior": "budget_stop_or_reviewed_increase",
         }
         or increase.get("contract_name") != BUDGET_INCREASE_CONTRACT_NAME
         or increase.get("contract_version") != 1
@@ -2241,7 +2242,7 @@ def derived_token_budget(
             "context_growth_per_inference": context_growth,
             "tier": resolution["tier"],
             "exact_output": False,
-            "efficiency_profile": "bounded-tool-loop-api-accounted-v2",
+            "efficiency_profile": "bounded-tool-loop-api-accounted-v3",
         }
     turn_cycle_cap = estimated_inferences
     tool_cycle_cap = (
@@ -2268,7 +2269,7 @@ def derived_token_budget(
     derived_cap = ((derived_cap + 999) // 1_000) * 1_000
     return {
         "mode": "derived",
-        "budget_formula_version": 2,
+        "budget_formula_version": 3,
         "token_cap": derived_cap,
         "model_cycle_cap": turn_cycle_cap,
         "turn_cycle_cap": turn_cycle_cap,

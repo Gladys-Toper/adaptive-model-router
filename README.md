@@ -4,6 +4,8 @@ Evidence-gated model and workflow routing skills for Codex. The router assigns e
 
 Planned work prefers fixed hash-bound context bundles. Tokens, harness-started model turns, tool calls, and wall time are capped independently; internal reasoning fragments do not inflate the model-turn count. Accepted execution receipts feed route-specific successful-use distributions; model cost/quota weights constrain headroom, and any larger envelope requires retained evidence plus an independent review receipt.
 
+Unchanged CI, scheduler, deployment, and merge state is polled by T0 deterministic processes. A routed model wakes only for terminal audit or failure diagnosis; it never holds a streaming wait tool open.
+
 ## Included skills
 
 - `adaptive-model-router` — model, reasoning-tier, evaluation, promotion, and rollback authority.

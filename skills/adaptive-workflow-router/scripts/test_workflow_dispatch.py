@@ -1020,7 +1020,7 @@ def test_t2_multifile_implementation_budget_is_token_efficient() -> None:
     assert budget["estimated_inferences"] == 3
     assert budget["turn_cycle_cap"] == 3
     assert budget["tool_cycle_cap"] == 6
-    assert budget["model_api_call_allowance"] == 7
+    assert budget["model_api_call_allowance"] == 8
     expected = (
         budget["model_api_call_allowance"]
         * (
@@ -1034,7 +1034,7 @@ def test_t2_multifile_implementation_budget_is_token_efficient() -> None:
     assert budget["token_cap"] == expected
     assert (
         budget["factors"]["efficiency_profile"]
-        == "bounded-tool-loop-api-accounted-v2"
+        == "bounded-tool-loop-api-accounted-v3"
     )
 
 
@@ -1156,7 +1156,7 @@ def test_turn_tool_and_model_api_call_accounting_are_independent() -> None:
         token_cap=200,
         model_cycle_cap=1,
         tool_cycle_cap=3,
-        model_api_call_allowance=7,
+        model_api_call_allowance=8,
     )
     assert record["turn_cycles"] == 1
     assert record["tool_cycles"] == 3
@@ -1164,17 +1164,18 @@ def test_turn_tool_and_model_api_call_accounting_are_independent() -> None:
     assert not issues
 
     _, breach_issues = DISPATCH.runtime_record(
-        tool_loop_events([20, 40, 60, 80, 100, 120, 140, 160], 6),
+        tool_loop_events([20, 40, 60, 80, 100, 120, 140, 160, 180], 6),
         thread_id=THREAD,
         turn_id=TURN,
         requested=REQUESTED,
         token_cap=200,
         model_cycle_cap=1,
         tool_cycle_cap=6,
-        model_api_call_allowance=7,
+        model_api_call_allowance=8,
     )
-    assert "model API-call allowance exceeded: 8 > 7" in breach_issues
-    assert DISPATCH.model_api_call_allowance("default", 2) == 3
+    assert "model API-call allowance exceeded: 9 > 8" in breach_issues
+    assert DISPATCH.model_api_call_allowance("default", 2) == 4
+    assert DISPATCH.model_api_call_allowance("default", 1) == 3
     assert DISPATCH.model_api_call_allowance("none", 20) == 1
 
 
@@ -1246,7 +1247,7 @@ def test_calibration_failures_are_static_non_learning_regressions() -> None:
         )
         expected_cap = ((expected_cap + 999) // 1_000) * 1_000
         assert case["v1_token_cap"] < case["usage_totals"][-1]
-        assert expected_cap >= case["minimum_v2_token_cap"]
+        assert expected_cap >= case["minimum_v3_token_cap"]
         assert expected_cap >= case["usage_totals"][-1]
         assert case["observed_turn_cycles"] <= case["turn_cycle_cap"]
         assert case["observed_tool_cycles"] <= case["tool_cycle_cap"]
@@ -1265,7 +1266,7 @@ def test_calibration_failures_are_static_non_learning_regressions() -> None:
             model_api_call_allowance=case["model_api_call_allowance"],
         )
         assert any("token cap exceeded" in issue for issue in v1_issues)
-        _, v2_issues = DISPATCH.runtime_record(
+        _, v3_issues = DISPATCH.runtime_record(
             replay_events,
             thread_id=THREAD,
             turn_id=TURN,
@@ -1277,8 +1278,30 @@ def test_calibration_failures_are_static_non_learning_regressions() -> None:
         )
         assert not any(
             "cap exceeded" in issue or "allowance exceeded" in issue
-            for issue in v2_issues
+            for issue in v3_issues
         )
+
+    for case in fixture["provider_call_cases"]:
+        assert case["calibration_role"] == fixture["calibration_role"]
+        assert case["observed_tool_cycles"] <= case["tool_cycle_cap"]
+        allowance = DISPATCH.model_api_call_allowance(
+            "default", case["tool_cycle_cap"]
+        )
+        assert case["observed_model_api_call_updates"] <= allowance
+        _, issues = DISPATCH.runtime_record(
+            tool_loop_events(
+                list(range(20, 20 * (case["observed_model_api_call_updates"] + 1), 20)),
+                case["observed_tool_cycles"],
+            ),
+            thread_id=THREAD,
+            turn_id=TURN,
+            requested=REQUESTED,
+            token_cap=500,
+            model_cycle_cap=1,
+            tool_cycle_cap=case["tool_cycle_cap"],
+            model_api_call_allowance=allowance,
+        )
+        assert not any("allowance exceeded" in issue for issue in issues)
 
     with tempfile.TemporaryDirectory(prefix="workflow-budget-failure-fixture-") as temporary:
         root = Path(temporary)
@@ -1428,7 +1451,7 @@ def test_successful_usage_distribution_calibrates_exact_versioned_route() -> Non
         assert measured["turn_cycle_cap"] == measured["model_cycle_cap"]
         assert measured["tool_cycle_cap"] >= 4
         assert measured["model_api_call_allowance"] == (
-            measured["tool_cycle_cap"] + 1
+            measured["tool_cycle_cap"] + 2
         )
         assert measured["recommended_wall_time_seconds"] >= 24
         assert preserved["accepted_history"]["sample_count"] == 5
