@@ -436,6 +436,15 @@ def test_required_skill_requires_fresh_read(root: Path) -> None:
 
 def test_direct_dispatch_closes_ephemeral_coordinator(root: Path) -> None:
     with_home(root)
+    original_cpu_count = GOV.os.cpu_count
+    GOV.os.cpu_count = lambda: 1
+    try:
+        assert (
+            GOV.trusted_capacity_snapshot()["available_weight_units"]
+            >= GOV._direct_resource_weight()
+        )
+    finally:
+        GOV.os.cpu_count = original_cpu_count
     reservation = GOV.reserve_agent(tree_id="direct", role="reviewer")
     ephemeral = reservation["ephemeral_coordinator_lease_id"]
     assert isinstance(ephemeral, str) and ephemeral
