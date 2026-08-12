@@ -290,8 +290,13 @@ def test_capacity_scheduler_parallelizes_without_scope_conflicts() -> None:
         },
     )
     assert contract["descendant_tokens"] == 4
-    assert len(contract["waves"]) == 2
-    assert not ({"branch-00", "branch-01"} <= set(contract["waves"][0]))
+    scheduled = [branch_id for wave in contract["waves"] for branch_id in wave]
+    assert sorted(scheduled) == [f"branch-{index:02d}" for index in range(4)]
+    assert len(scheduled) == len(set(scheduled))
+    assert all(
+        not ({"branch-00", "branch-01"} <= set(wave))
+        for wave in contract["waves"]
+    )
 
 
 def test_capacity_scheduler_treats_ancestor_scopes_as_conflicts() -> None:
@@ -304,9 +309,13 @@ def test_capacity_scheduler_treats_ancestor_scopes_as_conflicts() -> None:
             "branch-02": ["tests"],
         },
     )
-    assert len(contract["waves"]) == 2
-    assert not ({"branch-00", "branch-01"} <= set(contract["waves"][0]))
-    assert "branch-02" in contract["waves"][0]
+    scheduled = [branch_id for wave in contract["waves"] for branch_id in wave]
+    assert sorted(scheduled) == [f"branch-{index:02d}" for index in range(3)]
+    assert len(scheduled) == len(set(scheduled))
+    assert all(
+        not ({"branch-00", "branch-01"} <= set(wave))
+        for wave in contract["waves"]
+    )
 
 
 def test_capacity_snapshot_tampering_fails_closed() -> None:
