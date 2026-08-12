@@ -11,6 +11,7 @@ import io
 import json
 import multiprocessing
 import os
+import subprocess
 import sys
 import tempfile
 import time
@@ -100,7 +101,16 @@ def test_install_journal_blocks_execution_except_bound_verifier() -> None:
         )
         os.chmod(journal_path, 0o600)
 
-        for command in ("run", "resume", "smoke"):
+        for command in (
+            "run",
+            "resume",
+            "smoke",
+            "open-tree",
+            "close-tree",
+            "skill-read",
+            "register-quality",
+            "check",
+        ):
             try:
                 DISPATCH.enforce_install_admission(
                     command, journal_path=journal_path, environ={}
@@ -125,8 +135,8 @@ def test_install_journal_blocks_execution_except_bound_verifier() -> None:
                 environ={DISPATCH.INSTALL_VERIFY_TOKEN_ENV: token},
             )
 
-        # Non-executing health/registration commands remain inspectable.
-        for command in ("check", "register-quality"):
+        # Pure capacity derivation does not read or mutate installed state.
+        for command in ("capacity-plan",):
             DISPATCH.enforce_install_admission(
                 command, journal_path=journal_path, environ={}
             )
@@ -1363,8 +1373,84 @@ def test_successful_usage_distribution_calibrates_exact_versioned_route() -> Non
             exact_output=None,
         )
         with isolated_registry(root / "registry") as registry:
-            for index, total in enumerate((20_000, 22_000, 24_000, 26_000, 28_000)):
-                DISPATCH.append_execution_receipt(
+            quality_index = 0
+
+            def accept(
+                execution: dict[str, Any], accepted: bool = True
+            ) -> dict[str, Any]:
+                nonlocal quality_index
+                quality_index += 1
+                grader = DISPATCH.DETERMINISTIC_GRADER.resolve()
+                actual = root / f"budget-actual-{quality_index}.txt"
+                actual.write_text("accepted output\n", encoding="utf-8")
+                grader_input_value = {
+                    "schema_version": 1,
+                    "case_id": f"budget-case-{quality_index}",
+                    "evaluated_arm": "challenger",
+                    "evaluated_execution_receipt_ids": [execution["receipt_id"]],
+                    "grader_identity_sha256": DISPATCH.sha256_bytes(
+                        grader.read_bytes()
+                    ),
+                    "rubric_sha256": "d" * 64,
+                    "checks": [
+                        {
+                            "name": "task-accepted",
+                            "kind": "file_sha256",
+                            "actual_path": str(actual.resolve()),
+                            "expected_sha256": (
+                                DISPATCH.sha256_bytes(actual.read_bytes())
+                                if accepted
+                                else "0" * 64
+                            ),
+                        }
+                    ],
+                }
+                quality_path = root / f"budget-quality-{quality_index}.json"
+                grader_input = root / f"budget-grader-input-{quality_index}.json"
+                DISPATCH.write_json(grader_input, grader_input_value)
+                completed = subprocess.run(
+                    [str(grader)],
+                    input=grader_input.read_bytes(),
+                    capture_output=True,
+                    check=True,
+                )
+                quality = json.loads(completed.stdout)
+                DISPATCH.write_json(quality_path, quality)
+                normalized = DISPATCH.quality_acceptance(quality)
+                payload = {
+                    "quality_artifact_path": str(quality_path.resolve()),
+                    "quality_artifact_sha256": DISPATCH.sha256_bytes(
+                        quality_path.read_bytes()
+                    ),
+                    "grader_kind": "deterministic",
+                    "grader_identity_sha256": quality[
+                        "grader_identity_sha256"
+                    ],
+                    "rubric_sha256": quality["rubric_sha256"],
+                    "case_id": quality["case_id"],
+                    "evaluated_arm": "challenger",
+                    "evaluated_execution_receipt_ids": [execution["receipt_id"]],
+                    **normalized,
+                    "producer_kind": "pinned-deterministic-grader",
+                    "producer_path": str(grader),
+                    "producer_sha256": DISPATCH.sha256_bytes(grader.read_bytes()),
+                    "grader_input_path": str(grader_input.resolve()),
+                    "grader_input_sha256": DISPATCH.sha256_bytes(
+                        grader_input.read_bytes()
+                    ),
+                    "producer_stdout_sha256": DISPATCH.sha256_bytes(
+                        completed.stdout
+                    ),
+                }
+                DISPATCH.append_quality_receipt(payload)
+                return payload
+
+            last_execution: dict[str, Any] | None = None
+            last_quality_payload: dict[str, Any] | None = None
+            for index, total in enumerate(
+                (20_000, 22_000, 24_000, 26_000, 28_000, 30_000)
+            ):
+                execution = DISPATCH.append_execution_receipt(
                     {
                         "status": "COMPLETED",
                         "accepted_usage": {
@@ -1386,7 +1472,13 @@ def test_successful_usage_distribution_calibrates_exact_versioned_route() -> Non
                         },
                     }
                 )
-            DISPATCH.append_execution_receipt(
+                last_quality_payload = accept(execution)
+                last_execution = execution
+            assert last_execution is not None and last_quality_payload is not None
+            contradictory = dict(last_quality_payload)
+            contradictory["quality_verdict"] = "FAIL"
+            DISPATCH.append_quality_receipt(contradictory)
+            wrong_version = DISPATCH.append_execution_receipt(
                 {
                     "status": "COMPLETED",
                     "accepted_usage": {
@@ -1404,7 +1496,8 @@ def test_successful_usage_distribution_calibrates_exact_versioned_route() -> Non
                     },
                 }
             )
-            DISPATCH.append_execution_receipt(
+            accept(wrong_version)
+            wrong_model = DISPATCH.append_execution_receipt(
                 {
                     "status": "COMPLETED",
                     "accepted_usage": {
@@ -1422,6 +1515,26 @@ def test_successful_usage_distribution_calibrates_exact_versioned_route() -> Non
                     },
                 }
             )
+            accept(wrong_model)
+            rejected = DISPATCH.append_execution_receipt(
+                {
+                    "status": "COMPLETED",
+                    "accepted_usage": {
+                        "workflow_id": "coding.change",
+                        "workflow_version": 1,
+                        "phase_id": "implement",
+                        "activity": "implement",
+                        "model": "gpt-5.6-terra",
+                        "effort": "medium",
+                        "tool_mode": "default",
+                        "total_tokens": 999_000,
+                        "turn_cycles": 10,
+                        "tool_cycles": 10,
+                        "duration_ms": 999_000,
+                    },
+                }
+            )
+            accept(rejected, accepted=False)
             measured = DISPATCH.apply_measured_success_envelope(
                 base,
                 request,
@@ -1460,6 +1573,255 @@ def test_successful_usage_distribution_calibrates_exact_versioned_route() -> Non
         assert preserved["turn_cycle_cap"] == preserved["model_cycle_cap"]
         assert preserved["tool_cycle_cap"] >= 4
         assert preserved["recommended_wall_time_seconds"] >= 24
+
+
+def test_parallel_capacity_branch_binds_route_and_resource_envelope() -> None:
+    with tempfile.TemporaryDirectory(prefix="workflow-capacity-") as temporary:
+        root = Path(temporary)
+        subprocess.run(["git", "init", "-q", str(root)], check=True)
+        (root / "README.md").write_text("bound\n", encoding="utf-8")
+        subprocess.run(["git", "-C", str(root), "add", "README.md"], check=True)
+        subprocess.run(
+            [
+                "git",
+                "-C",
+                str(root),
+                "-c",
+                "user.name=Harness Test",
+                "-c",
+                "user.email=harness@example.invalid",
+                "commit",
+                "-qm",
+                "baseline",
+            ],
+            check=True,
+        )
+        source_commit = subprocess.run(
+            ["git", "-C", str(root), "rev-parse", "HEAD"],
+            text=True,
+            capture_output=True,
+            check=True,
+        ).stdout.strip()
+        now = time.time()
+        packet_hash = "c" * 64
+        plan_id = "d" * 64
+        contract = DISPATCH.governance.build_capacity_contract(
+            {
+                "schema_version": 1,
+                "contract_name": DISPATCH.governance.CAPACITY_REQUEST_NAME,
+                "contract_version": 1,
+                "tree_id": "capacity-test",
+                "source_commit": source_commit,
+                "created_at_epoch": now,
+                "expires_at_epoch": now + 3600,
+                "branches": [
+                    {
+                        "branch_id": "inspect-one",
+                        "depends_on": [],
+                        "mutation_scopes": [],
+                        "workflow_id": "review.audit",
+                        "workflow_version": 1,
+                        "phase_id": "inspect",
+                        "model": "gpt-5.6-terra",
+                        "effort": "medium",
+                        "cost_weight": 1.0,
+                        "quota_weight": 1.0,
+                        "token_cap": 50_000,
+                        "model_cycle_cap": 1,
+                        "tool_cycle_cap": 0,
+                        "wall_time_seconds": 600,
+                        "plan_id": plan_id,
+                        "phase_key": "inspect",
+                        "dispatch_packet_sha256": packet_hash,
+                        "sandbox": "read-only",
+                        "network_access": False,
+                        "tool_mode": "none",
+                        "mutation_authorized": False,
+                    }
+                ],
+            }
+        )
+        packet = {
+            "plan_id": plan_id,
+            "phase_key": "inspect",
+            "dispatch_packet_sha256": packet_hash,
+            "runtime_contract": {
+                "sandbox": "read-only",
+                "network_access": False,
+                "tool_mode": "none",
+                "mutation_authorized": False,
+            },
+        }
+        args = argparse.Namespace(
+            cwd=root,
+            sandbox="read-only",
+            network_access=False,
+            tool_mode="none",
+            mutation_authorized=False,
+            _dispatch_packet=packet,
+            _capacity_contract=contract,
+            capacity_branch_id="inspect-one",
+            _agent_lease={
+                "capacity_contract_sha256": contract["contract_sha256"],
+                "capacity_branch_id": "inspect-one",
+            },
+        )
+        request = {
+            "workflow_id": "review.audit",
+            "workflow_version": 1,
+            "phase_id": "inspect",
+        }
+        resolution = {"model": "gpt-5.6-terra", "effort": "medium"}
+        limits = {
+            "token_cap": 49_000,
+            "model_cycle_cap": 1,
+            "tool_cycle_cap": 0,
+            "wall_time_seconds": 600,
+        }
+        record = DISPATCH.capacity_branch_record(args, request, resolution, limits)
+        assert record is not None and record["branch_id"] == "inspect-one"
+        try:
+            DISPATCH.capacity_branch_record(
+                args, request, resolution, {**limits, "token_cap": 50_001}
+            )
+        except DISPATCH.DispatchError as error:
+            assert "resource envelope" in str(error)
+        else:
+            raise AssertionError("capacity branch exceeded its planned token envelope")
+        try:
+            DISPATCH.capacity_branch_record(
+                args, request, {**resolution, "model": "gpt-5.6-luna"}, limits
+            )
+        except DISPATCH.DispatchError as error:
+            assert "task or route" in str(error)
+        else:
+            raise AssertionError("capacity branch changed its planned model")
+        for field, changed in (
+            ("sandbox", "workspace-write"),
+            ("network_access", True),
+            ("tool_mode", "default"),
+            ("mutation_authorized", True),
+        ):
+            original = getattr(args, field)
+            setattr(args, field, changed)
+            try:
+                DISPATCH.capacity_branch_record(
+                    args, request, resolution, limits
+                )
+            except DISPATCH.DispatchError as error:
+                assert "permissions" in str(error)
+            else:
+                raise AssertionError(f"capacity branch changed {field}")
+            setattr(args, field, original)
+        args._dispatch_packet = {**packet, "dispatch_packet_sha256": "e" * 64}
+        try:
+            DISPATCH.capacity_branch_record(args, request, resolution, limits)
+        except DISPATCH.DispatchError as error:
+            assert "task or route" in str(error)
+        else:
+            raise AssertionError("capacity branch changed its dispatch packet")
+        args._dispatch_packet = packet
+        (root / "preexisting.txt").write_text("dirty\n", encoding="utf-8")
+        try:
+            DISPATCH.capacity_branch_record(args, request, resolution, limits)
+        except DISPATCH.DispatchError as error:
+            assert "clean task-bound worktree" in str(error)
+        else:
+            raise AssertionError("planned branch entered a dirty worktree")
+
+
+def test_capacity_snapshot_is_dispatcher_derived() -> None:
+    snapshot = DISPATCH.trusted_capacity_snapshot(now_epoch=time.time())
+    DISPATCH.validate_trusted_capacity_snapshot(snapshot, require_fresh=True)
+    expected_available = min(
+        snapshot["provider_weight_ceiling"],
+        max(
+            1.0,
+            snapshot["host_logical_cpus"]
+            / snapshot["host_logical_cpus_per_weight_unit"],
+        ),
+    )
+    assert snapshot["available_weight_units"] == expected_available
+    forged = dict(snapshot)
+    forged["available_weight_units"] = expected_available + 1.0
+    unsigned = dict(forged)
+    unsigned.pop("snapshot_sha256")
+    forged["snapshot_sha256"] = DISPATCH.content_hash(unsigned)
+    try:
+        DISPATCH.validate_trusted_capacity_snapshot(forged, require_fresh=True)
+    except (DISPATCH.DispatchError, DISPATCH.governance.GovernanceError):
+        pass
+    else:
+        raise AssertionError("caller-authored capacity snapshot was accepted")
+
+
+def test_capacity_workspace_enforces_declared_hierarchical_scope() -> None:
+    with tempfile.TemporaryDirectory(prefix="workflow-scope-") as temporary:
+        root = Path(temporary)
+        subprocess.run(["git", "init", "-q", str(root)], check=True)
+        (root / "owned").mkdir()
+        (root / "owned" / "baseline.txt").write_text("base\n", encoding="utf-8")
+        subprocess.run(["git", "-C", str(root), "add", "."], check=True)
+        subprocess.run(
+            [
+                "git",
+                "-C",
+                str(root),
+                "-c",
+                "user.name=Harness Test",
+                "-c",
+                "user.email=harness@example.invalid",
+                "commit",
+                "-qm",
+                "baseline",
+            ],
+            check=True,
+        )
+        source_commit = subprocess.run(
+            ["git", "-C", str(root), "rev-parse", "HEAD"],
+            text=True,
+            capture_output=True,
+            check=True,
+        ).stdout.strip()
+        contract = {
+            "source_commit": source_commit,
+            "branches": [
+                {
+                    "branch_id": "writer",
+                    "mutation_scopes": ["owned"],
+                    "sandbox": "workspace-write",
+                }
+            ],
+        }
+        args = argparse.Namespace(
+            cwd=root,
+            _capacity_contract=contract,
+            capacity_branch_id="writer",
+        )
+        (root / "owned" / "accepted.txt").write_text("accepted\n", encoding="utf-8")
+        assert DISPATCH.capacity_workspace_issues(args) == []
+        (root / "outside.txt").write_text("rejected\n", encoding="utf-8")
+        issues = DISPATCH.capacity_workspace_issues(args)
+        assert len(issues) == 1 and "outside.txt" in issues[0]
+        subprocess.run(
+            [
+                "git",
+                "-C",
+                str(root),
+                "-c",
+                "user.name=Harness Test",
+                "-c",
+                "user.email=harness@example.invalid",
+                "commit",
+                "--allow-empty",
+                "-qm",
+                "empty mutation",
+            ],
+            check=True,
+        )
+        identity_issues = DISPATCH.capacity_workspace_issues(args)
+        assert len(identity_issues) == 1
+        assert "task-bound source commit" in identity_issues[0]
 
 
 def test_budget_increase_requires_trusted_review_receipt() -> None:
@@ -1650,16 +2012,69 @@ def test_historical_mutating_transcripts_require_observed_tool_use() -> None:
         assert DISPATCH.execution_status(issues) == "COMPLETED"
 
 
-def test_workspace_write_instructions_identify_local_execution_bridge() -> None:
-    instructions = DISPATCH.local_mutation_tool_instructions(
-        "workspace-write", "default"
-    )
+def test_tool_instructions_identify_local_execution_bridge() -> None:
+    instructions = DISPATCH.local_tool_instructions("workspace-write", "default")
     assert "node_repl" in instructions
     assert "MCP `js` tool" in instructions
     assert "local execution and file-edit bridge" in instructions
     assert "apply_patch" in instructions
-    assert DISPATCH.local_mutation_tool_instructions("read-only", "default") == ""
-    assert DISPATCH.local_mutation_tool_instructions("workspace-write", "none") == ""
+    read_only = DISPATCH.local_tool_instructions("read-only", "default")
+    assert "node_repl" in read_only
+    assert "local inspection bridge" in read_only
+    assert DISPATCH.local_tool_instructions("workspace-write", "none") == ""
+
+
+def test_local_tool_readiness_blocks_turn_start_until_ready() -> None:
+    class FakeServer:
+        def __init__(self, values: list[dict[str, Any]]) -> None:
+            self.values = iter(values)
+
+        def next_event(self, unused_deadline: float) -> dict[str, Any]:
+            del unused_deadline
+            try:
+                return next(self.values)
+            except StopIteration as error:
+                raise DISPATCH.AppServerDeadline("fixture exhausted") from error
+
+    unrelated = {
+        "method": "mcpServer/startupStatus/updated",
+        "params": {"threadId": "foreign", "name": "node_repl", "status": "ready"},
+    }
+    starting = {
+        "method": "mcpServer/startupStatus/updated",
+        "params": {"threadId": THREAD, "name": "node_repl", "status": "starting"},
+    }
+    ready = {
+        "method": "mcpServer/startupStatus/updated",
+        "params": {"threadId": THREAD, "name": "node_repl", "status": "ready"},
+    }
+    assert DISPATCH.wait_for_local_tool_ready(
+        FakeServer([unrelated, starting, ready]),
+        THREAD,
+        time.monotonic() + 1,
+        timeout_seconds=1,
+    ) == {"required": True, "server": "node_repl", "status": "ready"}
+
+    failed = {
+        "method": "mcpServer/startupStatus/updated",
+        "params": {
+            "threadId": THREAD,
+            "name": "node_repl",
+            "status": "failed",
+            "error": "bridge failed",
+        },
+    }
+    try:
+        DISPATCH.wait_for_local_tool_ready(
+            FakeServer([failed]),
+            THREAD,
+            time.monotonic() + 1,
+            timeout_seconds=1,
+        )
+    except DISPATCH.DispatchError as error:
+        assert "bridge failed" in str(error)
+    else:
+        raise AssertionError("tool route started without its local execution bridge")
 
 
 def test_no_tools_contract_rejects_unknown_and_extended_item_types() -> None:
@@ -2936,6 +3351,8 @@ def test_deterministic_quality_is_recomputed_before_registration() -> None:
             receipts = DISPATCH._decode_receipt_registry(registry.read_bytes())
             assert len(receipts) == 2
             assert receipts[1]["receipt_type"] == "quality"
+            assert receipts[1]["quality_accepted"] is True
+            assert receipts[1]["quality_verdict"] == "PASS"
             assert receipts[1]["producer_kind"] == "pinned-deterministic-grader"
             assert receipts[1]["evaluated_execution_receipt_ids"] == [
                 evaluated["receipt_id"]
@@ -2999,6 +3416,8 @@ def test_blind_quality_is_bound_to_registered_grader_output() -> None:
             receipts = DISPATCH._decode_receipt_registry(registry.read_bytes())
             assert len(receipts) == 3
             assert receipts[2]["receipt_type"] == "quality"
+            assert receipts[2]["quality_accepted"] is True
+            assert receipts[2]["quality_verdict"] == "PASS"
             assert receipts[2]["producer_receipt_id"] == producer["receipt_id"]
             assert receipts[2]["evaluated_execution_receipt_ids"] == [
                 evaluated["receipt_id"]
@@ -3037,10 +3456,14 @@ if __name__ == "__main__":
         test_usage_regression_and_late_wall_event_fail_closed,
         test_calibration_failures_are_static_non_learning_regressions,
         test_successful_usage_distribution_calibrates_exact_versioned_route,
+        test_parallel_capacity_branch_binds_route_and_resource_envelope,
+        test_capacity_snapshot_is_dispatcher_derived,
+        test_capacity_workspace_enforces_declared_hierarchical_scope,
         test_budget_increase_requires_trusted_review_receipt,
         test_no_tools_contract_rejects_tool_items,
         test_historical_mutating_transcripts_require_observed_tool_use,
-        test_workspace_write_instructions_identify_local_execution_bridge,
+        test_tool_instructions_identify_local_execution_bridge,
+        test_local_tool_readiness_blocks_turn_start_until_ready,
         test_no_tools_contract_rejects_unknown_and_extended_item_types,
         test_no_tools_live_interrupt_ignores_foreign_thread_events,
         test_malformed_event_shapes_become_dispatch_errors,

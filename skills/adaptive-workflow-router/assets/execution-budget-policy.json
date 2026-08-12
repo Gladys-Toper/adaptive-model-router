@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "policy_name": "adaptive-workflow.execution-budget-policy",
-  "policy_version": 3,
+  "policy_version": 5,
   "cold_start_accounting": {
     "tool_enabled_model_api_call_allowance": "tool_cycle_cap_plus_two",
     "tool_mode_none_model_api_call_allowance": 1,
@@ -10,6 +10,8 @@
     "unobserved_provider_call_behavior": "budget_stop_or_reviewed_increase"
   },
   "accepted_history": {
+    "quality_receipt_required": true,
+    "acceptance_rule": "all_registered_quality_receipts_pass",
     "minimum_samples": 5,
     "percentile": 0.9,
     "headroom": 1.15,
@@ -40,6 +42,12 @@
   "unknown_model_resource_weights": {
     "cost_weight": 1.5,
     "quota_weight": 1.5
+  },
+  "parallel_capacity": {
+    "snapshot_source": "local-host-plus-active-policy",
+    "snapshot_ttl_seconds": 900,
+    "provider_weight_ceiling": 6.0,
+    "host_logical_cpus_per_weight_unit": 2.0
   },
   "increase_contract": {
     "contract_name": "adaptive-workflow.execution-budget-increase",
