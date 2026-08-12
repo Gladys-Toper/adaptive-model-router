@@ -22,8 +22,7 @@ from typing import Any, Iterator
 SCRIPT = Path(__file__).resolve().parent / "workflow_dispatch.py"
 CALIBRATION_FIXTURE = (
     Path(__file__).resolve().parents[1]
-    / "tests"
-    / "fixtures"
+    / "assets"
     / "adaptive-budget-calibration-failures-v1.json"
 )
 SPEC = importlib.util.spec_from_file_location("workflow_dispatch", SCRIPT)
