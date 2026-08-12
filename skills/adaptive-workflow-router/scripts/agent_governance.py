@@ -174,7 +174,8 @@ def _execution_policy() -> tuple[dict[str, Any], str]:
         or not isinstance(unknown, dict)
     ):
         raise GovernanceError("parallel capacity policy has an invalid schema")
-    for record in [*weights.values(), unknown]:
+    resource_records = [*weights.values(), unknown]
+    for record in resource_records:
         if (
             not isinstance(record, dict)
             or set(record) != {"cost_weight", "quota_weight"}
@@ -182,6 +183,14 @@ def _execution_policy() -> tuple[dict[str, Any], str]:
             or not _finite_positive(record.get("quota_weight"))
         ):
             raise GovernanceError("parallel capacity model weights are invalid")
+    maximum_route_weight = max(
+        max(float(record["cost_weight"]), float(record["quota_weight"]))
+        for record in resource_records
+    )
+    if float(parallel["provider_weight_ceiling"]) < maximum_route_weight:
+        raise GovernanceError(
+            "parallel capacity ceiling cannot admit one supported route"
+        )
     return policy, sha256_bytes(raw)
 
 
@@ -189,11 +198,19 @@ def trusted_capacity_snapshot(*, now_epoch: float | None = None) -> dict[str, An
     """Derive capacity inside the governance authority, never from a caller."""
     execution_policy, policy_sha256 = _execution_policy()
     policy = execution_policy["parallel_capacity"]
+    resource_records = [
+        *execution_policy["model_resource_weights"].values(),
+        execution_policy["unknown_model_resource_weights"],
+    ]
+    single_dispatch_floor = max(
+        max(float(record["cost_weight"]), float(record["quota_weight"]))
+        for record in resource_records
+    )
     host_logical_cpus = os.cpu_count() or 1
     available = min(
         float(policy["provider_weight_ceiling"]),
         max(
-            1.0,
+            single_dispatch_floor,
             host_logical_cpus
             / float(policy["host_logical_cpus_per_weight_unit"]),
         ),
