@@ -1,0 +1,127 @@
+{
+  "schema_version": 1,
+  "revision": 1,
+  "updated_at": "2026-07-10T00:00:00Z",
+  "source": "ported-from-codex-baseline-2026-07-10",
+  "tiers": {
+    "T0": {
+      "mode": "deterministic"
+    },
+    "T1": {
+      "agent": "fast-operator",
+      "profile_file": "fast-operator.md",
+      "model": "haiku",
+      "effort": "low",
+      "fallbacks": [
+        {
+          "model": "sonnet",
+          "effort": "low"
+        }
+      ]
+    },
+    "T2": {
+      "agent": "standard-worker",
+      "profile_file": "standard-worker.md",
+      "model": "sonnet",
+      "effort": "medium",
+      "fallbacks": [
+        {
+          "model": "opus",
+          "effort": "medium"
+        }
+      ]
+    },
+    "T3": {
+      "agent": "high-solver",
+      "profile_file": "high-solver.md",
+      "model": "opus",
+      "effort": "high",
+      "fallbacks": [
+        {
+          "model": "fable",
+          "effort": "high"
+        },
+        {
+          "model": "sonnet",
+          "effort": "high"
+        }
+      ]
+    },
+    "T4": {
+      "agent": "ultra-planner",
+      "profile_file": "ultra-planner.md",
+      "model": "fable",
+      "effort": "max",
+      "fallbacks": [
+        {
+          "model": "opus",
+          "effort": "xhigh"
+        },
+        {
+          "model": "sonnet",
+          "effort": "xhigh"
+        }
+      ]
+    }
+  },
+  "constraints": {
+    "allowed_provider": "anthropic",
+    "cli_selectable_efforts": {
+      "low": true,
+      "medium": true,
+      "high": true,
+      "xhigh": false,
+      "max": false
+    },
+    "allowed_service_tiers": [
+      "default",
+      "priority"
+    ],
+    "default_service_tier": "default",
+    "execution_evidence_mode": "runtime-metadata",
+    "forbidden_model_patterns": [
+      "gpt",
+      "openai",
+      "gemini",
+      "grok",
+      "deepseek",
+      "llama",
+      "mistral",
+      "qwen",
+      "kimi"
+    ],
+    "require_local_catalog_availability": true,
+    "require_enforced_model_identity_for_evals": true,
+    "attestation_verifier_path": null,
+    "attestation_verifier_sha256": null
+  },
+  "promotion": {
+    "min_pairs_by_tier": {
+      "T1": 12,
+      "T2": 12,
+      "T3": 16,
+      "T4": 16
+    },
+    "min_holdout_pairs": 4,
+    "min_task_families": 3,
+    "max_quality_drop": 0.02,
+    "min_quality_gain": 0.05,
+    "min_efficiency_gain": 0.1,
+    "max_efficiency_regression": 0.15,
+    "max_extra_failures_by_tier": {
+      "T1": 1,
+      "T2": 1,
+      "T3": 0,
+      "T4": 0
+    },
+    "require_zero_candidate_critical_failures": true,
+    "auto_promote_qualified": true,
+    "snapshot_retention": 5
+  },
+  "canary": {
+    "window_pairs": 10,
+    "consecutive_bad_windows": 2,
+    "max_quality_drop": 0.03,
+    "max_efficiency_regression": 0.25
+  }
+}

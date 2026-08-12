@@ -1,0 +1,55 @@
+{
+  "schema_version": 1,
+  "revision": 1,
+  "updated_at": "2026-08-12T00:00:00Z",
+  "source": "cursor-agent-models-live-probe-2026-08-12",
+  "evidence_grade": "declared-weak-experimental",
+  "tiers": {
+    "T0": {
+      "mode": "deterministic"
+    },
+    "T1": {
+      "agent": "fast_operator",
+      "model": "composer-2.5-fast",
+      "effort": "default",
+      "fallbacks": [
+        {"model": "composer-2.5", "effort": "default"},
+        {"model": "gpt-5.3-codex-low-fast", "effort": "low"}
+      ]
+    },
+    "T2": {
+      "agent": "standard_worker",
+      "model": "gpt-5.3-codex",
+      "effort": "medium",
+      "fallbacks": [
+        {"model": "gpt-5.3-codex-fast", "effort": "medium"},
+        {"model": "gpt-5.6-terra-medium", "effort": "medium"}
+      ]
+    },
+    "T3": {
+      "agent": "high_solver",
+      "model": "gpt-5.3-codex-high",
+      "effort": "high",
+      "fallbacks": [
+        {"model": "gpt-5.3-codex-high-fast", "effort": "high"},
+        {"model": "gpt-5.6-terra-high", "effort": "high"}
+      ]
+    },
+    "T4": {
+      "agent": "ultra_planner",
+      "model": "gpt-5.3-codex-xhigh",
+      "effort": "xhigh",
+      "fallbacks": [
+        {"model": "gpt-5.6-sol-xhigh", "effort": "xhigh"}
+      ]
+    }
+  },
+  "constraints": {
+    "allowed_provider": "cursor",
+    "default_service_tier": "default",
+    "anthropic_default_allowed": false,
+    "forbidden_model_patterns": ["claude", "anthropic", "no_zdr"],
+    "execution_evidence_mode": "declared-cli-output",
+    "require_local_catalog_availability": true
+  }
+}

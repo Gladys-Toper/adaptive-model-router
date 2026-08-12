@@ -1,0 +1,462 @@
+{
+  "absent_trees": [],
+  "files": [
+    {
+      "mode": "0o644",
+      "path": "skills/claude/adaptive-model-router/SKILL.md",
+      "sha256": "743a8ac9b80d8a3c5387e93b504e71e78db0b583e964073716baa11619270be1",
+      "size": 13435
+    },
+    {
+      "mode": "0o644",
+      "path": "skills/claude/adaptive-model-router/assets/claude-catalog.json",
+      "sha256": "91c216a4df1c0ad954c8d78aa5f7969a84f3691f86eea385de7b6454425bacf2",
+      "size": 2964
+    },
+    {
+      "mode": "0o644",
+      "path": "skills/claude/adaptive-model-router/assets/custom-agents/fast-operator.md",
+      "sha256": "8edc5584863d3dde53d6f38aee274b8fcead38f700f6310323dfeff838c88862",
+      "size": 686
+    },
+    {
+      "mode": "0o644",
+      "path": "skills/claude/adaptive-model-router/assets/custom-agents/high-solver.md",
+      "sha256": "ebb691aa365d023bc6d4ed79b0342e3021d5e7027fe44ce0e701d6ddac89b163",
+      "size": 557
+    },
+    {
+      "mode": "0o644",
+      "path": "skills/claude/adaptive-model-router/assets/custom-agents/standard-worker.md",
+      "sha256": "141024f90cbde16dda16b124e457737feaefb34cea53716d20269942cdb3ef5c",
+      "size": 510
+    },
+    {
+      "mode": "0o644",
+      "path": "skills/claude/adaptive-model-router/assets/custom-agents/ultra-planner.md",
+      "sha256": "0786efac5cbb1c98be510578e618d4fd287b7fcc98de291f4212b29ad5805f42",
+      "size": 629
+    },
+    {
+      "mode": "0o644",
+      "path": "skills/claude/adaptive-model-router/assets/default-policy.json",
+      "sha256": "24e15c0ca9132936d246c124cc5c7ca4c8c8b642b7ea7ef5e8f6a5d13a910e50",
+      "size": 2732
+    },
+    {
+      "mode": "0o644",
+      "path": "skills/claude/adaptive-model-router/assets/eval-suite.jsonl",
+      "sha256": "3f053f30aff2fe975aa2d4d74fd3fe205eeb9b83afa93cdb39ab7e6aab18f5c0",
+      "size": 12182
+    },
+    {
+      "mode": "0o644",
+      "path": "skills/claude/adaptive-model-router/references/self-improvement-protocol.md",
+      "sha256": "75e299d41728b142d2a5de4e31ae281b6d4bc637e7794df209afbf087657cd7c",
+      "size": 9980
+    },
+    {
+      "mode": "0o644",
+      "path": "skills/claude/adaptive-model-router/scripts/install_agent_profiles.py",
+      "sha256": "41916d9a2e42b2e4bd30e057d9988c56a19b6ff3811452bf12fcf6e5f3d3d31f",
+      "size": 3238
+    },
+    {
+      "mode": "0o644",
+      "path": "skills/claude/adaptive-model-router/scripts/router_lab.py",
+      "sha256": "b3ec477c0c4ba8c1255f330a2c50aed7f9a4a4df8cd6d4dfb4982925e0798b38",
+      "size": 135085
+    },
+    {
+      "mode": "0o644",
+      "path": "skills/claude/adaptive-model-router/scripts/test_router_lab.py",
+      "sha256": "dec74f734fb8da9c05b08a3dbb692649331044cb4314f6c1dee1759812def03c",
+      "size": 13079
+    },
+    {
+      "mode": "0o644",
+      "path": "skills/claude/adaptive-workflow-router/SKILL.md",
+      "sha256": "3936d18cd8eae7f7fed9afff6afca222b5dfe2978458e958d18da11ae34d71cc",
+      "size": 24472
+    },
+    {
+      "mode": "0o644",
+      "path": "skills/claude/adaptive-workflow-router/assets/adaptive-budget-calibration-failures-v1.json",
+      "sha256": "bd0365044959b401dc4e2f44d28c14d2e5e4f4719ea85f38d766e31e09e3ac0c",
+      "size": 4488
+    },
+    {
+      "mode": "0o644",
+      "path": "skills/claude/adaptive-workflow-router/assets/execution-budget-policy.json",
+      "sha256": "e9a84c0f012351c1d284cc99dd3e7564280503d85087f04054eda36e53ac35e0",
+      "size": 1591
+    },
+    {
+      "mode": "0o644",
+      "path": "skills/claude/adaptive-workflow-router/assets/learning-loop-policy.json",
+      "sha256": "a34a9c37bc0b6746e34ded8c64633bb334bb65560a25aa3a937b17609d4b5ccd",
+      "size": 1111
+    },
+    {
+      "mode": "0o644",
+      "path": "skills/claude/adaptive-workflow-router/assets/workflows.json",
+      "sha256": "419e8bd8f520d9dc4d854bd0bb927058e675fa3d44d3bd8fab73becdf84c1765",
+      "size": 34027
+    },
+    {
+      "mode": "0o644",
+      "path": "skills/claude/adaptive-workflow-router/references/learning-loop-contract.md",
+      "sha256": "ae5538aceef959094a3c69f25cbb8dab8571ff2d544bc373b4cdf87d478a860a",
+      "size": 13570
+    },
+    {
+      "mode": "0o644",
+      "path": "skills/claude/adaptive-workflow-router/references/research-basis.md",
+      "sha256": "1a3b8bcc473037b9408bed6fd6ee510ec8431cafae7264e4c55bbfba5b307763",
+      "size": 11154
+    },
+    {
+      "mode": "0o644",
+      "path": "skills/claude/adaptive-workflow-router/references/workflow-contract.md",
+      "sha256": "21b5dd5a48c7dc4e6738bf0995cbdde4d2b3f0386427b6d02d28f1c9406b009a",
+      "size": 25390
+    },
+    {
+      "mode": "0o644",
+      "path": "skills/claude/adaptive-workflow-router/scripts/agent_governance.py",
+      "sha256": "db745046ef31168802f0be1a8e5fb8d45854f0ec636d7f491b189e239796037f",
+      "size": 59657
+    },
+    {
+      "mode": "0o755",
+      "path": "skills/claude/adaptive-workflow-router/scripts/deterministic_quality_grader.py",
+      "sha256": "1a736960f8317d8988a2aba445a6960c8e3e3b2d094dbfd8bcac29f2c6ff8c86",
+      "size": 3625
+    },
+    {
+      "mode": "0o644",
+      "path": "skills/claude/adaptive-workflow-router/scripts/learning_loop.py",
+      "sha256": "1dc8ec6d3821a15c12894f03de6cfe55a61d57948cbaa2092db8e2c30043d59c",
+      "size": 172824
+    },
+    {
+      "mode": "0o644",
+      "path": "skills/claude/adaptive-workflow-router/scripts/test_agent_governance.py",
+      "sha256": "6ac119818ed23bd6fa5a6fb8adee11729dcc6f0c42f2727ac35a18a9229df7cf",
+      "size": 19132
+    },
+    {
+      "mode": "0o644",
+      "path": "skills/claude/adaptive-workflow-router/scripts/test_learning_loop.py",
+      "sha256": "43083183d4ee4f1c9f47e95a73d0953aa9f6e59537ad8a9d196ccb46638a81d7",
+      "size": 57857
+    },
+    {
+      "mode": "0o644",
+      "path": "skills/claude/adaptive-workflow-router/scripts/test_workflow_dispatch.py",
+      "sha256": "dfae9331118b53230949dfc087dec1a233c1b86c1fcb2372e77ff7ae7d93dfbe",
+      "size": 17541
+    },
+    {
+      "mode": "0o755",
+      "path": "skills/claude/adaptive-workflow-router/scripts/test_workflow_plan.py",
+      "sha256": "b51f2334e4b87fe7ed0bc48329d8afc37684d5a304e1f0d58acf7598bba842d6",
+      "size": 33232
+    },
+    {
+      "mode": "0o644",
+      "path": "skills/claude/adaptive-workflow-router/scripts/workflow_dispatch.py",
+      "sha256": "9b509ee51833d69e23d8d98b27f812cec539f7ae5038164be83366884cd221b0",
+      "size": 38558
+    },
+    {
+      "mode": "0o755",
+      "path": "skills/claude/adaptive-workflow-router/scripts/workflow_plan.py",
+      "sha256": "b25edeeb5a781e6a045d1e4e138617d732e581276bfa850c5eec762c520ddedb",
+      "size": 86952
+    },
+    {
+      "mode": "0o644",
+      "path": "skills/codex/adaptive-model-router/SKILL.md",
+      "sha256": "3956d4edb5cb4ca4c3bfa6043d355893a67f09f3400019cc1bcd920d51bc18aa",
+      "size": 18230
+    },
+    {
+      "mode": "0o644",
+      "path": "skills/codex/adaptive-model-router/agents/openai.yaml",
+      "sha256": "9b378d0ec1a37d9ace9ee685084eba82ff8470df099002007fba6c4df0baf8b4",
+      "size": 313
+    },
+    {
+      "mode": "0o644",
+      "path": "skills/codex/adaptive-model-router/assets/custom-agents/fast-operator.toml",
+      "sha256": "3586581befbccf417e890b39e72738e2ebc5d3aae17a5dc31fdf45df46a1cee5",
+      "size": 746
+    },
+    {
+      "mode": "0o644",
+      "path": "skills/codex/adaptive-model-router/assets/custom-agents/high-solver.toml",
+      "sha256": "fcc7728d4087e3fe65704e7f999cd654b257d0af84eec742bcc55a84e9ac6415",
+      "size": 619
+    },
+    {
+      "mode": "0o644",
+      "path": "skills/codex/adaptive-model-router/assets/custom-agents/standard-worker.toml",
+      "sha256": "ca50faf26379c3d032d203c59383240683b01232a59dec6edf0a51fc09bfcc3d",
+      "size": 570
+    },
+    {
+      "mode": "0o644",
+      "path": "skills/codex/adaptive-model-router/assets/custom-agents/ultra-planner.toml",
+      "sha256": "57f48ca11db0132f6fe7df123f69850c8871b39036d097798577c0576d1bf2ea",
+      "size": 674
+    },
+    {
+      "mode": "0o644",
+      "path": "skills/codex/adaptive-model-router/assets/default-policy.json",
+      "sha256": "4e6e56bf10c0347fe0c70f465739323bfa26b331a2e3e0c60a74fec47297248d",
+      "size": 3161
+    },
+    {
+      "mode": "0o644",
+      "path": "skills/codex/adaptive-model-router/assets/eval-suite.jsonl",
+      "sha256": "3f053f30aff2fe975aa2d4d74fd3fe205eeb9b83afa93cdb39ab7e6aab18f5c0",
+      "size": 12182
+    },
+    {
+      "mode": "0o644",
+      "path": "skills/codex/adaptive-model-router/references/self-improvement-protocol.md",
+      "sha256": "92e1a531691c5f561cae16b46564387ad2f237b1767274011b29d132b961dbaa",
+      "size": 24075
+    },
+    {
+      "mode": "0o644",
+      "path": "skills/codex/adaptive-model-router/scripts/install_agent_profiles.py",
+      "sha256": "75891f2e02c3399b4f38505f16f6a473ee4f909a6174787ee22725fd30a28a13",
+      "size": 3052
+    },
+    {
+      "mode": "0o644",
+      "path": "skills/codex/adaptive-model-router/scripts/router_lab.py",
+      "sha256": "75fc69e8da05824acf94e36e769c3b68298b2d4e5c58fd97a3011d7bf38a8413",
+      "size": 213733
+    },
+    {
+      "mode": "0o644",
+      "path": "skills/codex/adaptive-model-router/scripts/test_router_lab.py",
+      "sha256": "b9ce41b58e34a3950a9a934c387230f3dda24d3e9dda83d4545d84fa8d8f540c",
+      "size": 27506
+    },
+    {
+      "mode": "0o644",
+      "path": "skills/codex/adaptive-workflow-router/SKILL.md",
+      "sha256": "153abfc3fbd816236bb32f8aa57fc81d9ecc6022e2c6632cefdb2cbf2eb8d63f",
+      "size": 25312
+    },
+    {
+      "mode": "0o644",
+      "path": "skills/codex/adaptive-workflow-router/agents/openai.yaml",
+      "sha256": "46c2c24b9c2b8a8925632793a8b6727a9db57b3643aa3c54062ab3dd69a3b6c3",
+      "size": 350
+    },
+    {
+      "mode": "0o644",
+      "path": "skills/codex/adaptive-workflow-router/assets/adaptive-budget-calibration-failures-v1.json",
+      "sha256": "bd0365044959b401dc4e2f44d28c14d2e5e4f4719ea85f38d766e31e09e3ac0c",
+      "size": 4488
+    },
+    {
+      "mode": "0o644",
+      "path": "skills/codex/adaptive-workflow-router/assets/execution-budget-policy.json",
+      "sha256": "2092370eb13f2b976f61685673df767e09158b58f04f6ea1b88031fc2c8d816f",
+      "size": 1538
+    },
+    {
+      "mode": "0o644",
+      "path": "skills/codex/adaptive-workflow-router/assets/learning-loop-policy.json",
+      "sha256": "a34a9c37bc0b6746e34ded8c64633bb334bb65560a25aa3a937b17609d4b5ccd",
+      "size": 1111
+    },
+    {
+      "mode": "0o644",
+      "path": "skills/codex/adaptive-workflow-router/assets/resumption-policy.json",
+      "sha256": "7d0808857aef78e2bcf1d8ac484362dd2b610899201f44c548dfd3f1054d93e6",
+      "size": 769
+    },
+    {
+      "mode": "0o644",
+      "path": "skills/codex/adaptive-workflow-router/assets/workflows.json",
+      "sha256": "419e8bd8f520d9dc4d854bd0bb927058e675fa3d44d3bd8fab73becdf84c1765",
+      "size": 34027
+    },
+    {
+      "mode": "0o644",
+      "path": "skills/codex/adaptive-workflow-router/references/learning-loop-contract.md",
+      "sha256": "c408d409a7f16c6eb9de8b86f3ac0669a198a80a34e34a9d1a9bc18e0cfaca34",
+      "size": 12567
+    },
+    {
+      "mode": "0o644",
+      "path": "skills/codex/adaptive-workflow-router/references/research-basis.md",
+      "sha256": "78e1e30e873823f6882bc51b40fa5908128fba7dfa835f790bc2a1e769dcf702",
+      "size": 11140
+    },
+    {
+      "mode": "0o644",
+      "path": "skills/codex/adaptive-workflow-router/references/workflow-contract.md",
+      "sha256": "1ec13916d741333f62d352113b37df039aee2e0aa45520b9c0cd03145e70d0d3",
+      "size": 25640
+    },
+    {
+      "mode": "0o644",
+      "path": "skills/codex/adaptive-workflow-router/scripts/agent_governance.py",
+      "sha256": "8574714a71543c4e33dfdf4f2d9f318b5b198b0f05c7c69d9167e6067b712e9a",
+      "size": 59619
+    },
+    {
+      "mode": "0o755",
+      "path": "skills/codex/adaptive-workflow-router/scripts/deterministic_quality_grader.py",
+      "sha256": "1a736960f8317d8988a2aba445a6960c8e3e3b2d094dbfd8bcac29f2c6ff8c86",
+      "size": 3625
+    },
+    {
+      "mode": "0o644",
+      "path": "skills/codex/adaptive-workflow-router/scripts/learning_loop.py",
+      "sha256": "8a0a446940e2d0c80f782d5498c3d967aec4867a7a86a6bb4c17ddbe529d398a",
+      "size": 168153
+    },
+    {
+      "mode": "0o755",
+      "path": "skills/codex/adaptive-workflow-router/scripts/resume_canary.py",
+      "sha256": "e8df006ed214ff349587c1ceaff1505129c84745f5dbfc6cffdbb103b15d8d39",
+      "size": 12158
+    },
+    {
+      "mode": "0o644",
+      "path": "skills/codex/adaptive-workflow-router/scripts/test_agent_governance.py",
+      "sha256": "7bb920f4108b7ef6fecede2472237d0696302346343b3705fa5df497c51f167c",
+      "size": 19139
+    },
+    {
+      "mode": "0o644",
+      "path": "skills/codex/adaptive-workflow-router/scripts/test_learning_loop.py",
+      "sha256": "97255a15c997ade1214e540963dcc79c1615613f5b0748f50c482828f2cf3c5e",
+      "size": 56059
+    },
+    {
+      "mode": "0o755",
+      "path": "skills/codex/adaptive-workflow-router/scripts/test_workflow_dispatch.py",
+      "sha256": "6b011650e3587f77f0fad818dd574a3cb4cb67c164a44dcbeda3710e36a8a6dc",
+      "size": 152912
+    },
+    {
+      "mode": "0o755",
+      "path": "skills/codex/adaptive-workflow-router/scripts/test_workflow_plan.py",
+      "sha256": "2153812012f09dbc5190a56c2b4f35fa8bc747146a99645c6b04adf575648af5",
+      "size": 34376
+    },
+    {
+      "mode": "0o755",
+      "path": "skills/codex/adaptive-workflow-router/scripts/workflow_dispatch.py",
+      "sha256": "04aa04137821ac1f1ab2db8aab06f161ed18498f919fc9e8a9c1e48e036912ae",
+      "size": 285296
+    },
+    {
+      "mode": "0o755",
+      "path": "skills/codex/adaptive-workflow-router/scripts/workflow_plan.py",
+      "sha256": "028e2bf179b7fa2dd89a50db9075484a5c09ee983703b21ba13c044a525c1178",
+      "size": 86581
+    },
+    {
+      "mode": "0o644",
+      "path": "skills/cursor/adaptive-model-router/SKILL.md",
+      "sha256": "98edc6655fd31dd57c527aaa267fa403c8eb70f262073c18a288865eed5a5f04",
+      "size": 6099
+    },
+    {
+      "mode": "0o644",
+      "path": "skills/cursor/adaptive-model-router/assets/cursor-catalog.json",
+      "sha256": "4d94413729884dea247be6f87fe658c0416fa8f3f443c58610855d4e452ecd4c",
+      "size": 4240
+    },
+    {
+      "mode": "0o644",
+      "path": "skills/cursor/adaptive-model-router/assets/default-policy.json",
+      "sha256": "3320340354b51d49a375fbd9298863413e1c4f977b0514698f58a959721e8bf7",
+      "size": 1546
+    },
+    {
+      "mode": "0o644",
+      "path": "skills/cursor/adaptive-model-router/references/dispatch-contract.md",
+      "sha256": "974e441e4cca1b9cd8db9353455041f03daf344884fb9c8175b7377d216fff83",
+      "size": 3089
+    },
+    {
+      "mode": "0o644",
+      "path": "skills/cursor/adaptive-model-router/references/self-improvement-protocol.md",
+      "sha256": "5cc08ebef59d58b24bfdc78c801f87223c3104d6d457c86d5ba0fd6ad0702fa0",
+      "size": 2463
+    },
+    {
+      "mode": "0o644",
+      "path": "skills/cursor/adaptive-model-router/scripts/router_lab.py",
+      "sha256": "fa3fa8bda07ed65b77a0c59b796e983250beb9acf62565a5e567e48eb8fdef69",
+      "size": 19309
+    },
+    {
+      "mode": "0o644",
+      "path": "skills/cursor/adaptive-model-router/scripts/test_router_lab.py",
+      "sha256": "af64f00495efaeb99079688b9ed30c9803ed163a9de35ebe4690b0a0d0c732bb",
+      "size": 8122
+    },
+    {
+      "mode": "0o644",
+      "path": "skills/cursor/adaptive-workflow-router/SKILL.md",
+      "sha256": "efc1ef93e88eafd3804573a1513c7ff271f175cc31af574526395cf5eb62026a",
+      "size": 3757
+    },
+    {
+      "mode": "0o644",
+      "path": "skills/cursor/adaptive-workflow-router/assets/resumption-policy.json",
+      "sha256": "7d0808857aef78e2bcf1d8ac484362dd2b610899201f44c548dfd3f1054d93e6",
+      "size": 769
+    },
+    {
+      "mode": "0o644",
+      "path": "skills/cursor/adaptive-workflow-router/assets/workflows.json",
+      "sha256": "419e8bd8f520d9dc4d854bd0bb927058e675fa3d44d3bd8fab73becdf84c1765",
+      "size": 34027
+    },
+    {
+      "mode": "0o644",
+      "path": "skills/cursor/adaptive-workflow-router/references/workflow-contract.md",
+      "sha256": "74b172412d0fdd3972c5adc0d2df03e8cb66951b51149e3f5962750f39fa5ce3",
+      "size": 3956
+    },
+    {
+      "mode": "0o755",
+      "path": "skills/cursor/adaptive-workflow-router/scripts/test_workflow_plan.py",
+      "sha256": "822400c89ee70761b07a556a67e1c565bb9324a487f6b428ab2aa6025b44f1a3",
+      "size": 34817
+    },
+    {
+      "mode": "0o755",
+      "path": "skills/cursor/adaptive-workflow-router/scripts/workflow_plan.py",
+      "sha256": "028e2bf179b7fa2dd89a50db9075484a5c09ee983703b21ba13c044a525c1178",
+      "size": 86581
+    }
+  ],
+  "generated_at": "2026-08-12T18:14:44Z",
+  "harness_source_commit": "0687510529ccc010ee796e00bbdcb55e3eccf329",
+  "harness_worktree_dirty": false,
+  "published_trees": [
+    "skills/codex/adaptive-model-router",
+    "skills/codex/adaptive-workflow-router",
+    "skills/claude/adaptive-model-router",
+    "skills/claude/adaptive-workflow-router",
+    "skills/cursor/adaptive-model-router",
+    "skills/cursor/adaptive-workflow-router"
+  ],
+  "schema_version": 1,
+  "type": "adaptive-router.publish-sync-manifest"
+}
