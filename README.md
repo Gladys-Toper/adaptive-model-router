@@ -2,9 +2,13 @@
 
 Evidence-gated model and workflow routing skills for Codex. The router assigns each phase to the smallest proven model/reasoning tier, while the workflow harness composes multi-phase work and preserves execution evidence, promotion gates, and rollback.
 
-Planned work prefers fixed hash-bound context bundles. Tokens, harness-started model turns, tool calls, and wall time are capped independently; internal reasoning fragments do not inflate the model-turn count. Accepted execution receipts feed route-specific successful-use distributions; model cost/quota weights constrain headroom, and any larger envelope requires retained evidence plus an independent review receipt.
+Planned work prefers fixed, hash-bound context bundles. Tokens, harness-started model turns, tool calls, API calls, and wall time are capped independently; internal reasoning fragments do not inflate the model-turn count. Tool-enabled work waits for its local execution bridge before model dispatch.
 
-Unchanged CI, scheduler, deployment, and merge state is polled by T0 deterministic processes. A routed model wakes only for terminal audit or failure diagnosis; it never holds a streaming wait tool open.
+Accepted completion receipts record actual use by workflow, observed model, and effort. Only revalidated, unanimously quality-accepted receipts enter successful-use distributions. Future envelopes combine those measured distributions with model-specific cost and quota weights; a larger envelope requires retained evidence and an independently reviewed increase contract.
+
+Parallelism is task-derived rather than agent-count-capped. A deterministic planner packs an exact branch DAG into dependency-safe, mutation-conflict-free waves under a trusted global weighted-capacity snapshot. More than nine branches are valid when the work and capacity justify them; unbound descendants, source drift, scope overlap, and completion without a matching execution receipt fail closed.
+
+Unchanged CI, scheduler, deployment, and merge state is polled by deterministic processes. A routed model wakes only for terminal audit or failure diagnosis; it never holds a streaming wait tool open.
 
 ## Included skills
 

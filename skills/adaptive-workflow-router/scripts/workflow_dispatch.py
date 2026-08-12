@@ -121,6 +121,8 @@ CHECKPOINT_IDENTITY_FIELDS = {
     "interruption_reason",
 }
 NO_TOOLS_PASSIVE_ITEM_TYPES = {"userMessage", "reasoning", "agentMessage"}
+LOCAL_TOOL_SERVER = "node_repl"
+LOCAL_TOOL_READY_TIMEOUT_SECONDS = 15
 RUNTIME_EVIDENCE_METHODS = {
     "thread/settings/updated",
     "turn/started",
@@ -225,6 +227,96 @@ def _files_changed(cwd: Path) -> list[str]:
     return sorted(names)
 
 
+def _git_paths(cwd: Path, arguments: list[str]) -> list[str]:
+    try:
+        completed = subprocess.run(
+            ["git", "-C", str(cwd), *arguments],
+            capture_output=True,
+            timeout=10,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return []
+    if completed.returncode != 0:
+        return []
+    return sorted(
+        {
+            item.decode("utf-8", errors="strict")
+            for item in completed.stdout.split(b"\0")
+            if item
+        }
+    )
+
+
+def _capacity_files_changed(cwd: Path, baseline_commit: str) -> list[str]:
+    """Include both retained worktree changes and commits made during a branch."""
+    committed = _git_paths(
+        cwd,
+        ["diff", "--name-only", "--diff-filter=ACDMRTUXB", "-z", baseline_commit, "--"],
+    )
+    return sorted(set(committed) | set(_files_changed(cwd)))
+
+
+def _git_head(cwd: Path) -> str | None:
+    try:
+        completed = subprocess.run(
+            ["git", "-C", str(cwd), "rev-parse", "HEAD"],
+            text=True,
+            capture_output=True,
+            timeout=10,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    value = completed.stdout.strip().lower()
+    if completed.returncode != 0 or len(value) not in {40, 64}:
+        return None
+    return value
+
+
+def capacity_workspace_issues(args: argparse.Namespace) -> list[str]:
+    contract = getattr(args, "_capacity_contract", None)
+    branch_id = getattr(args, "capacity_branch_id", None)
+    if not isinstance(contract, dict):
+        return []
+    branch = next(
+        (
+            item
+            for item in contract.get("branches", [])
+            if item.get("branch_id") == branch_id
+        ),
+        None,
+    )
+    if not isinstance(branch, dict):
+        return ["parallel capacity branch disappeared before workspace verification"]
+    current_head = _git_head(args.cwd)
+    if current_head != contract["source_commit"]:
+        return [
+            "parallel capacity branch changed its task-bound source commit: "
+            f"{current_head or 'unavailable'}"
+        ]
+    changed = _capacity_files_changed(args.cwd, contract["source_commit"])
+    scopes = branch["mutation_scopes"]
+    if branch["sandbox"] == "read-only" and changed:
+        return ["parallel read-only capacity branch changed repository files"]
+    outside: list[str] = []
+    for path in changed:
+        try:
+            owned = any(
+                governance.mutation_scope_contains(scope, path) for scope in scopes
+            )
+        except governance.GovernanceError:
+            owned = False
+        if not owned:
+            outside.append(path)
+    if outside:
+        return [
+            "parallel capacity branch changed paths outside its exclusive mutation scopes: "
+            + ", ".join(outside)
+        ]
+    return []
+
+
 def workflow_receipt_fields(
     args: argparse.Namespace, *, status: str, issues: list[str]
 ) -> dict[str, Any]:
@@ -233,17 +325,144 @@ def workflow_receipt_fields(
         bound = _skill_requirements_from_packet(None, args.cwd)
     phase = getattr(args, "_planned_phase", None)
     exit_gate = phase.get("exit_gate", []) if isinstance(phase, dict) else []
+    lease = getattr(args, "_agent_lease", None)
+    lease_record = (
+        {
+            key: lease.get(key)
+            for key in (
+                "lease_id",
+                "tree_id",
+                "role",
+                "parent_lease_id",
+                "nested_capacity_tokens",
+                "capacity_contract_sha256",
+                "capacity_branch_id",
+                "resource_weight",
+                "issued_at_epoch",
+                "expires_at_epoch",
+            )
+        }
+        if isinstance(lease, dict)
+        else None
+    )
+    parallel_capacity = getattr(args, "_parallel_capacity", None)
     return {
         "required_skills": bound["required_skills"],
         "skill_hashes": bound["skill_hashes"],
         "source_commit": bound["source_commit"],
         "exit_gate": exit_gate,
         "files_changed": _files_changed(args.cwd),
+        "agent_lease": lease_record,
+        "parallel_capacity": parallel_capacity,
         "verification": {
             "dispatcher_acceptance": status == "COMPLETED",
             "runtime_identity_verified": status == "COMPLETED" and not issues,
             "issues": list(issues),
         },
+    }
+
+
+def capacity_branch_record(
+    args: argparse.Namespace,
+    request: dict[str, Any],
+    resolution: dict[str, Any],
+    limits: dict[str, int],
+) -> dict[str, Any] | None:
+    contract = getattr(args, "_capacity_contract", None)
+    branch_id = getattr(args, "capacity_branch_id", None)
+    if contract is None:
+        return None
+    branches = {
+        branch["branch_id"]: branch for branch in contract.get("branches", [])
+    }
+    branch = branches.get(branch_id)
+    if not isinstance(branch, dict):
+        raise DispatchError("parallel capacity branch is absent from its contract")
+    packet = getattr(args, "_dispatch_packet", None)
+    if not isinstance(packet, dict):
+        raise DispatchError(
+            "parallel capacity branch requires one validated planner dispatch packet"
+        )
+    if (
+        branch.get("workflow_id") != request.get("workflow_id")
+        or branch.get("workflow_version") != request.get("workflow_version")
+        or branch.get("phase_id") != request.get("phase_id")
+        or branch.get("model") != resolution.get("model")
+        or branch.get("effort") != resolution.get("effort")
+        or branch.get("plan_id") != packet.get("plan_id")
+        or branch.get("phase_key") != packet.get("phase_key")
+        or branch.get("dispatch_packet_sha256")
+        != packet.get("dispatch_packet_sha256")
+    ):
+        raise DispatchError("parallel capacity branch changed its planned task or route")
+    runtime_contract = packet.get("runtime_contract")
+    expected_permissions = {
+        "sandbox": args.sandbox,
+        "network_access": args.network_access,
+        "tool_mode": args.tool_mode,
+        "mutation_authorized": args.mutation_authorized,
+    }
+    if (
+        not isinstance(runtime_contract, dict)
+        or any(branch.get(field) != value for field, value in expected_permissions.items())
+        or any(
+            runtime_contract.get(field) != value
+            for field, value in expected_permissions.items()
+        )
+    ):
+        raise DispatchError("parallel capacity branch changed its planned permissions")
+    policy = load_execution_budget_policy()
+    expected_weights = policy["model_resource_weights"].get(
+        resolution.get("model"), policy["unknown_model_resource_weights"]
+    )
+    if any(
+        float(branch.get(field, -1)) != float(expected_weights[field])
+        for field in ("cost_weight", "quota_weight")
+    ):
+        raise DispatchError("parallel capacity branch changed its model resource weights")
+    limit_fields = {
+        "token_cap": "token_cap",
+        "model_cycle_cap": "model_cycle_cap",
+        "tool_cycle_cap": "tool_cycle_cap",
+        "wall_time_seconds": "wall_time_seconds",
+    }
+    if any(limits[target] > branch[source] for source, target in limit_fields.items()):
+        raise DispatchError("parallel capacity branch exceeds its planned resource envelope")
+    lease = getattr(args, "_agent_lease", None)
+    if (
+        not isinstance(lease, dict)
+        or lease.get("capacity_contract_sha256")
+        != contract.get("contract_sha256")
+        or lease.get("capacity_branch_id") != branch_id
+    ):
+        raise DispatchError("parallel capacity lease differs from its run binding")
+    validate_trusted_capacity_snapshot(
+        contract.get("capacity_snapshot"), require_fresh=False
+    )
+    if (
+        _git_head(args.cwd) != contract["source_commit"]
+        or _capacity_files_changed(args.cwd, contract["source_commit"])
+    ):
+        raise DispatchError(
+            "parallel capacity branch requires a clean task-bound worktree"
+        )
+    wave = next(
+        index
+        for index, branch_ids in enumerate(contract["waves"])
+        if branch_id in branch_ids
+    )
+    return {
+        "contract_sha256": contract["contract_sha256"],
+        "branch_id": branch_id,
+        "wave": wave,
+        "depends_on": branch["depends_on"],
+        "mutation_scopes": branch["mutation_scopes"],
+        "resource_weight": branch["resource_weight"],
+        "capacity_snapshot": contract["capacity_snapshot"],
+        "plan_id": branch["plan_id"],
+        "phase_key": branch["phase_key"],
+        "dispatch_packet_sha256": branch["dispatch_packet_sha256"],
+        "permissions": expected_permissions,
     }
 
 
@@ -302,11 +521,12 @@ def load_execution_budget_policy() -> dict[str, Any]:
     unknown = policy.get("unknown_model_resource_weights")
     increase = policy.get("increase_contract")
     cold_start = policy.get("cold_start_accounting")
+    parallel = policy.get("parallel_capacity")
     if (
         policy.get("schema_version") != 1
         or policy.get("policy_name")
         != "adaptive-workflow.execution-budget-policy"
-        or policy.get("policy_version") != 3
+        or policy.get("policy_version") != 5
         or not isinstance(history, dict)
         or type(history.get("minimum_samples")) is not int
         or history["minimum_samples"] < 1
@@ -325,9 +545,13 @@ def load_execution_budget_policy() -> dict[str, Any]:
             "effort",
             "tool_mode",
         ]
+        or history.get("quality_receipt_required") is not True
+        or history.get("acceptance_rule")
+        != "all_registered_quality_receipts_pass"
         or not isinstance(weights, dict)
         or not isinstance(unknown, dict)
         or not isinstance(increase, dict)
+        or not isinstance(parallel, dict)
         or cold_start
         != {
             "tool_enabled_model_api_call_allowance": "tool_cycle_cap_plus_two",
@@ -339,6 +563,22 @@ def load_execution_budget_policy() -> dict[str, Any]:
         or increase.get("contract_name") != BUDGET_INCREASE_CONTRACT_NAME
         or increase.get("contract_version") != 1
         or increase.get("review_workflow_id") != "review.audit"
+        or parallel.get("snapshot_source")
+        != "local-host-plus-active-policy"
+        or type(parallel.get("snapshot_ttl_seconds")) is not int
+        or not 1 <= parallel["snapshot_ttl_seconds"] <= 3600
+        or not isinstance(parallel.get("provider_weight_ceiling"), (int, float))
+        or isinstance(parallel.get("provider_weight_ceiling"), bool)
+        or not math.isfinite(float(parallel["provider_weight_ceiling"]))
+        or parallel["provider_weight_ceiling"] <= 0
+        or not isinstance(
+            parallel.get("host_logical_cpus_per_weight_unit"), (int, float)
+        )
+        or isinstance(parallel.get("host_logical_cpus_per_weight_unit"), bool)
+        or not math.isfinite(
+            float(parallel["host_logical_cpus_per_weight_unit"])
+        )
+        or parallel["host_logical_cpus_per_weight_unit"] <= 0
     ):
         raise DispatchError("execution budget policy has an invalid schema")
     for record in [*weights.values(), unknown]:
@@ -351,6 +591,24 @@ def load_execution_budget_policy() -> dict[str, Any]:
         ):
             raise DispatchError("execution budget model weights are invalid")
     return policy
+
+
+def trusted_capacity_snapshot(*, now_epoch: float | None = None) -> dict[str, Any]:
+    """Expose the snapshot minted by the governance authority."""
+    load_execution_budget_policy()
+    return governance.trusted_capacity_snapshot(now_epoch=now_epoch)
+
+
+def validate_trusted_capacity_snapshot(
+    snapshot: dict[str, Any], *, require_fresh: bool
+) -> dict[str, Any]:
+    load_execution_budget_policy()
+    try:
+        return governance.validate_trusted_capacity_snapshot(
+            snapshot, require_fresh=require_fresh
+        )
+    except governance.GovernanceError as error:
+        raise DispatchError(str(error)) from error
 
 
 def accepted_usage_samples(
@@ -380,12 +638,64 @@ def accepted_usage_samples(
         "effort": resolution.get("effort"),
         "tool_mode": tool_mode,
     }
+    receipt_by_id = {
+        receipt.get("receipt_id"): receipt
+        for receipt in receipts
+        if isinstance(receipt.get("receipt_id"), str)
+    }
+    candidate_execution_ids = {
+        receipt["receipt_id"]
+        for receipt in receipts
+        if receipt.get("receipt_type") == "execution"
+        and receipt.get("status") == "COMPLETED"
+        and isinstance(receipt.get("receipt_id"), str)
+        and isinstance(receipt.get("issued_at_epoch"), (int, float))
+        and receipt["issued_at_epoch"] >= cutoff
+        and isinstance(receipt.get("accepted_usage"), dict)
+        and all(
+            receipt["accepted_usage"].get(field) == value
+            for field, value in expected.items()
+        )
+    }
+    quality_results: dict[str, list[bool]] = {}
+    for receipt in receipts:
+        if receipt.get("receipt_type") != "quality":
+            continue
+        accepted = receipt.get("quality_accepted")
+        evaluated = receipt.get("evaluated_execution_receipt_ids")
+        if not isinstance(evaluated, list):
+            continue
+        valid_ids = [
+            receipt_id
+            for receipt_id in evaluated
+            if isinstance(receipt_id, str) and receipt_id
+        ]
+        if not (set(valid_ids) & candidate_execution_ids):
+            continue
+        receipt_is_valid = bool(valid_ids) and len(valid_ids) == len(
+            evaluated
+        ) and valid_ids == sorted(set(valid_ids))
+        receipt_accepts = (
+            registered_quality_receipt_acceptance(receipt, receipt_by_id)
+            if receipt_is_valid
+            else False
+        )
+        for receipt_id in valid_ids:
+            quality_results.setdefault(receipt_id, []).append(
+                accepted is True and receipt_accepts
+            )
+    accepted_execution_ids = {
+        receipt_id
+        for receipt_id, results in quality_results.items()
+        if results and all(results)
+    }
     samples: list[dict[str, Any]] = []
     for receipt in receipts:
         usage = receipt.get("accepted_usage")
         if (
             receipt.get("receipt_type") != "execution"
             or receipt.get("status") != "COMPLETED"
+            or receipt.get("receipt_id") not in accepted_execution_ids
             or not isinstance(receipt.get("issued_at_epoch"), (int, float))
             or receipt["issued_at_epoch"] < cutoff
             or not isinstance(usage, dict)
@@ -402,6 +712,182 @@ def accepted_usage_samples(
         if all(type(value) is int and value >= 0 for value in measured.values()):
             samples.append(measured)
     return samples
+
+
+def quality_acceptance(quality: dict[str, Any]) -> dict[str, Any]:
+    """Normalize whether registered quality evidence accepts an execution."""
+    arm = quality.get("evaluated_arm")
+    if quality.get("grader_kind") == "deterministic":
+        arms = quality.get("arms")
+        result = arms.get(arm) if isinstance(arms, dict) else None
+        score = result.get("quality_score") if isinstance(result, dict) else None
+        gates = result.get("objective_gates") if isinstance(result, dict) else None
+        if (
+            not isinstance(score, (int, float))
+            or isinstance(score, bool)
+            or not math.isfinite(float(score))
+            or not 0 <= float(score) <= 1
+            or not isinstance(gates, dict)
+            or not gates
+            or not all(isinstance(name, str) and name for name in gates)
+            or not all(type(value) is bool for value in gates.values())
+        ):
+            raise DispatchError("deterministic quality result is malformed")
+        accepted = all(gates.values()) and float(score) == 1.0
+        return {
+            "quality_accepted": accepted,
+            "quality_score": float(score),
+            "quality_verdict": "PASS" if accepted else "FAIL",
+            "objective_gates": gates,
+        }
+    if quality.get("grader_kind") == "blind_independent":
+        score = quality.get("quality")
+        verdict = quality.get("verdict")
+        if (
+            not isinstance(score, (int, float))
+            or isinstance(score, bool)
+            or not math.isfinite(float(score))
+            or not 0 <= float(score) <= 1
+            or verdict not in {"PASS", "FAIL"}
+        ):
+            raise DispatchError("blind quality result is malformed")
+        return {
+            "quality_accepted": verdict == "PASS",
+            "quality_score": float(score),
+            "quality_verdict": verdict,
+            "objective_gates": {},
+        }
+    raise DispatchError("quality artifact has an unsupported grader kind")
+
+
+def registered_quality_receipt_acceptance(
+    receipt: dict[str, Any], receipt_by_id: dict[str, dict[str, Any]]
+) -> bool:
+    """Revalidate retained quality provenance before it can train budgets."""
+    try:
+        path_value = receipt.get("quality_artifact_path")
+        if not isinstance(path_value, str):
+            return False
+        path = Path(path_value)
+        if (
+            not path.is_absolute()
+            or path.is_symlink()
+            or not path.is_file()
+            or str(path.resolve(strict=True)) != path_value
+            or receipt.get("quality_artifact_sha256")
+            != sha256_bytes(path.read_bytes())
+        ):
+            return False
+        quality = read_json(path, "registered quality artifact")
+        evaluated = receipt.get("evaluated_execution_receipt_ids")
+        if (
+            quality.get("schema_version") != 1
+            or quality.get("grader_kind") != receipt.get("grader_kind")
+            or quality.get("grader_identity_sha256")
+            != receipt.get("grader_identity_sha256")
+            or quality.get("rubric_sha256") != receipt.get("rubric_sha256")
+            or quality.get("case_id") != receipt.get("case_id")
+            or quality.get("evaluated_arm") != receipt.get("evaluated_arm")
+            or quality.get("evaluated_execution_receipt_ids") != evaluated
+            or not isinstance(evaluated, list)
+            or not evaluated
+            or evaluated != sorted(set(evaluated))
+            or any(
+                receipt_by_id.get(receipt_id, {}).get("receipt_type")
+                != "execution"
+                for receipt_id in evaluated
+            )
+        ):
+            return False
+        normalized = quality_acceptance(quality)
+        if any(receipt.get(field) != normalized[field] for field in normalized):
+            return False
+        grader_kind = receipt.get("grader_kind")
+        if grader_kind == "deterministic":
+            producer_path = receipt.get("producer_path")
+            grader_input_path = receipt.get("grader_input_path")
+            if not isinstance(producer_path, str) or not isinstance(
+                grader_input_path, str
+            ):
+                return False
+            producer = Path(producer_path)
+            grader_input = Path(grader_input_path)
+            if (
+                receipt.get("producer_kind") != "pinned-deterministic-grader"
+                or not producer.is_absolute()
+                or producer.is_symlink()
+                or not producer.is_file()
+                or producer.resolve(strict=True) != DETERMINISTIC_GRADER.resolve()
+                or receipt.get("producer_sha256")
+                != sha256_bytes(producer.read_bytes())
+                or receipt.get("grader_identity_sha256")
+                != receipt.get("producer_sha256")
+                or not grader_input.is_absolute()
+                or grader_input.is_symlink()
+                or not grader_input.is_file()
+                or str(grader_input.resolve(strict=True)) != grader_input_path
+                or receipt.get("grader_input_sha256")
+                != sha256_bytes(grader_input.read_bytes())
+                or not isinstance(receipt.get("producer_stdout_sha256"), str)
+                or not HEX_SHA256.fullmatch(receipt["producer_stdout_sha256"])
+            ):
+                return False
+            completed = subprocess.run(
+                [str(producer)],
+                input=grader_input.read_bytes(),
+                capture_output=True,
+                timeout=30,
+                check=False,
+            )
+            if (
+                completed.returncode != 0
+                or sha256_bytes(completed.stdout)
+                != receipt["producer_stdout_sha256"]
+                or json.loads(completed.stdout) != quality
+            ):
+                return False
+        elif grader_kind == "blind_independent":
+            producer = receipt_by_id.get(receipt.get("producer_receipt_id"))
+            if (
+                receipt.get("producer_kind")
+                != "registered-blind-independent-grader"
+                or not isinstance(producer, dict)
+                or producer.get("receipt_type") != "execution"
+                or producer.get("status") != "COMPLETED"
+                or receipt.get("producer_output_sha256")
+                != producer.get("final_output_sha256")
+                or receipt.get("producer_output_sha256")
+                != sha256_bytes(canonical_json(quality).encode("utf-8"))
+                or receipt.get("grader_identity_sha256")
+                != content_hash(
+                    {
+                        "observed_identity": producer.get("observed_identity"),
+                        "profile_sha256": producer.get("profile_sha256"),
+                    }
+                )
+            ):
+                return False
+            metadata_value = producer.get("metadata_path")
+            if not isinstance(metadata_value, str):
+                return False
+            metadata_path = Path(metadata_value)
+            if (
+                not metadata_path.is_absolute()
+                or metadata_path.is_symlink()
+                or not metadata_path.is_file()
+                or str(metadata_path.resolve(strict=True)) != metadata_value
+                or producer.get("metadata_sha256")
+                != sha256_bytes(metadata_path.read_bytes())
+            ):
+                return False
+            metadata = read_json(metadata_path, "registered blind grader metadata")
+            if json.loads(metadata.get("server", {}).get("output_text", "")) != quality:
+                return False
+        else:
+            return False
+        return normalized["quality_accepted"] is True
+    except (DispatchError, OSError, ValueError, TypeError, subprocess.SubprocessError):
+        return False
 
 
 def apply_measured_success_envelope(
@@ -1828,8 +2314,18 @@ def sandbox_policy(mode: str, cwd: Path, network_access: bool) -> dict[str, Any]
     raise DispatchError(f"unsupported worker sandbox: {mode}")
 
 
-def local_mutation_tool_instructions(sandbox: str, tool_mode: str) -> str:
-    if sandbox != "workspace-write" or tool_mode != "default":
+def local_tool_instructions(sandbox: str, tool_mode: str) -> str:
+    if tool_mode != "default":
+        return ""
+    if sandbox == "read-only":
+        return (
+            " This is an authorized local read-only route. On this App Server "
+            "the node_repl MCP `js` tool is the local inspection bridge, not an "
+            "external connector. Use it only for reads inside the bound filesystem, "
+            "and do not claim local tools are unavailable without first attempting "
+            "node_repl."
+        )
+    if sandbox != "workspace-write":
         return ""
     return (
         " This is an authorized local workspace-write route. On this App Server "
@@ -1839,6 +2335,49 @@ def local_mutation_tool_instructions(sandbox: str, tool_mode: str) -> str:
         "verify the resulting files. Do not claim local tools are unavailable "
         "without first attempting node_repl."
     )
+
+
+def wait_for_local_tool_ready(
+    server: Any,
+    thread_id: str,
+    deadline: float,
+    *,
+    timeout_seconds: int = LOCAL_TOOL_READY_TIMEOUT_SECONDS,
+) -> dict[str, Any]:
+    """Do not start a model turn before its required local MCP bridge is ready."""
+    readiness_deadline = min(deadline, time.monotonic() + timeout_seconds)
+    last_status: str | None = None
+    last_error: str | None = None
+    while True:
+        try:
+            event = server.next_event(readiness_deadline)
+        except AppServerDeadline as error:
+            detail = f"; last status={last_status}" if last_status else ""
+            if last_error:
+                detail += f"; error={last_error}"
+            raise DispatchError(
+                f"required local tool server {LOCAL_TOOL_SERVER!r} was not ready "
+                f"within {timeout_seconds}s{detail}"
+            ) from error
+        if event.get("method") != "mcpServer/startupStatus/updated":
+            continue
+        params = event.get("params", {})
+        if (
+            not isinstance(params, dict)
+            or params.get("threadId") != thread_id
+            or params.get("name") != LOCAL_TOOL_SERVER
+        ):
+            continue
+        last_status = params.get("status")
+        error_value = params.get("error") or params.get("failureReason")
+        if isinstance(error_value, str) and error_value:
+            last_error = error_value
+        if last_status == "ready":
+            return {
+                "required": True,
+                "server": LOCAL_TOOL_SERVER,
+                "status": "ready",
+            }
 
 
 def validate_authority(
@@ -4050,6 +4589,7 @@ def _run_resumable_phase(
                     "receipt_sha256": receipt["receipt_sha256"],
                 },
             )
+            args._dispatcher_receipt = receipt
             printed = dict(metadata)
             printed["dispatcher_receipt_id"] = receipt["receipt_id"]
             printed["dispatcher_receipt_sha256"] = receipt["receipt_sha256"]
@@ -4252,6 +4792,9 @@ def run_phase(args: argparse.Namespace) -> int:
         validate_dispatch_packet(
             plan_binding["dispatch_packet"], expected_packet
         )
+        args._dispatch_packet = plan_binding["dispatch_packet"]
+    else:
+        args._dispatch_packet = None
     resume_contract = (
         plan_binding["dispatch_packet"].get("resume_contract")
         if plan_binding
@@ -4477,6 +5020,10 @@ def run_phase(args: argparse.Namespace) -> int:
     tool_cycle_cap = requested_limits["tool_cycle_cap"]
     api_call_allowance = requested_limits["model_api_call_allowance"]
     effective_wall_time_seconds = requested_limits["wall_time_seconds"]
+    parallel_capacity = capacity_branch_record(
+        args, request, resolution, requested_limits
+    )
+    args._parallel_capacity = parallel_capacity
     initial_checkpoint_path = getattr(args, "resume_checkpoint", None)
     initial_checkpoint: dict[str, Any] | None = None
     if initial_checkpoint_path is not None:
@@ -4546,6 +5093,7 @@ def run_phase(args: argparse.Namespace) -> int:
             else None
         ),
         "expected_exact_output": args.expect_exact_output,
+        "parallel_capacity": parallel_capacity,
     }
     if resume_contract is not None:
         manifest["resume_contract"] = resume_contract
@@ -4636,7 +5184,7 @@ def run_phase(args: argparse.Namespace) -> int:
                 " This is a strict no-tools phase. Use only the bound context in the user "
                 "message and return the requested result in one response."
             )
-        developer_instructions += local_mutation_tool_instructions(
+        developer_instructions += local_tool_instructions(
             args.sandbox, args.tool_mode
         )
         thread_params: dict[str, Any] = {
@@ -4667,6 +5215,11 @@ def run_phase(args: argparse.Namespace) -> int:
         thread_id = thread_response.get("result", {}).get("thread", {}).get("id")
         if not isinstance(thread_id, str) or not thread_id:
             raise DispatchError("App Server omitted the thread ID")
+        tool_readiness = (
+            wait_for_local_tool_ready(server, thread_id, deadline)
+            if args.tool_mode == "default"
+            else {"required": False, "server": None, "status": "not-required"}
+        )
         server.send(
             {
                 "id": 3,
@@ -4888,6 +5441,7 @@ def run_phase(args: argparse.Namespace) -> int:
         timeout=10,
         check=False,
     ).stdout.strip()
+    issues.extend(capacity_workspace_issues(args))
     final_status = execution_status(issues)
     metadata = {
         "schema_version": 1,
@@ -4906,6 +5460,7 @@ def run_phase(args: argparse.Namespace) -> int:
             **runtime,
             "transcript_path": str(transcript),
             "transcript_sha256": transcript_hash,
+            "tool_readiness": tool_readiness,
         },
         "limits": {
             "token_cap": token_cap,
@@ -5391,6 +5946,7 @@ def check_health() -> int:
                 "planner_validate": planner_validate.returncode == 0,
                 "planner_route_binding": planner_plan.returncode == 0,
                 "generic_spawn_enforces_route": False,
+                "agent_governance": governance.capacity_status(),
                 "required_model_dispatch": "pinned-openai-codex-app-server",
                 "ordinary_execution_model_promotion_eligible": False,
             }
@@ -5551,6 +6107,7 @@ def register_quality(args: argparse.Namespace) -> int:
         "case_id": case_id,
         "evaluated_arm": evaluated_arm,
         "evaluated_execution_receipt_ids": evaluated_receipts,
+        **quality_acceptance(quality),
     }
     if grader_kind == "deterministic":
         if args.grader_executable is None or args.grader_input is None or args.producer_receipt_id:
@@ -5698,6 +6255,68 @@ def resume_phase(args: argparse.Namespace) -> int:
         raise
 
 
+def plan_parallel_capacity(args: argparse.Namespace) -> int:
+    request_path = args.request.expanduser().absolute()
+    request = read_json(request_path, "parallel capacity request")
+    policy = load_execution_budget_policy()
+    for branch in request.get("branches", []):
+        if not isinstance(branch, dict):
+            raise DispatchError("parallel capacity request contains a malformed branch")
+        expected = policy["model_resource_weights"].get(
+            branch.get("model"), policy["unknown_model_resource_weights"]
+        )
+        if any(
+            not isinstance(branch.get(field), (int, float))
+            or isinstance(branch.get(field), bool)
+            or float(branch[field]) != float(expected[field])
+            for field in ("cost_weight", "quota_weight")
+        ):
+            raise DispatchError(
+                "parallel capacity request model weights differ from active policy"
+            )
+    contract = governance.build_capacity_contract(request)
+    output = args.output.expanduser().absolute()
+    if output.exists() or output.is_symlink() or not output.parent.is_dir():
+        raise DispatchError("parallel capacity output must be a new safe file")
+    write_json(output, contract)
+    print(json.dumps(contract, indent=2, sort_keys=True))
+    return 0
+
+
+def open_parallel_tree(args: argparse.Namespace) -> int:
+    cwd = args.cwd.expanduser().resolve()
+    if not cwd.is_dir():
+        raise DispatchError("parallel tree cwd is missing")
+    path = args.capacity_contract.expanduser().absolute()
+    raw = read_json(path, "parallel capacity contract")
+    tree_id = raw.get("tree_id")
+    if not isinstance(tree_id, str):
+        raise DispatchError("parallel capacity contract omitted tree id")
+    contract = governance.load_capacity_contract(
+        path, tree_id=tree_id, source_commit=source_commit_for(cwd)
+    )
+    validate_trusted_capacity_snapshot(
+        contract["capacity_snapshot"], require_fresh=True
+    )
+    reservation = governance.reserve_agent(
+        tree_id=tree_id,
+        role="coordinator",
+        nested_capacity_tokens=contract["descendant_tokens"],
+        lease_seconds=args.lease_seconds,
+        capacity_contract=contract,
+    )
+    print(json.dumps(reservation, indent=2, sort_keys=True))
+    return 0
+
+
+def close_parallel_tree(args: argparse.Namespace) -> int:
+    receipt = governance.complete_coordinator(
+        args.lease_id, status=args.status, reason=args.reason
+    )
+    print(json.dumps(receipt, indent=2, sort_keys=True))
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = DispatchArgumentParser(description=__doc__)
     commands = parser.add_subparsers(
@@ -5739,6 +6358,28 @@ def build_parser() -> argparse.ArgumentParser:
         help="Consume one sealed explicit checkpoint with no runtime overrides",
     )
     resume.add_argument("--checkpoint", type=Path, required=True)
+    capacity_plan = commands.add_parser(
+        "capacity-plan",
+        help="Derive conflict-free parallel waves from an exact task DAG and capacity snapshot",
+    )
+    capacity_plan.add_argument("--request", type=Path, required=True)
+    capacity_plan.add_argument("--output", type=Path, required=True)
+    open_tree = commands.add_parser(
+        "open-tree",
+        help="Open one coordinator lease from a validated capacity contract",
+    )
+    open_tree.add_argument("--capacity-contract", type=Path, required=True)
+    open_tree.add_argument("--cwd", type=Path, required=True)
+    open_tree.add_argument("--lease-seconds", type=int, default=900)
+    close_tree = commands.add_parser(
+        "close-tree",
+        help="Terminalize a coordinator after its planned branches settle",
+    )
+    close_tree.add_argument("--lease-id", required=True)
+    close_tree.add_argument(
+        "--status", choices=("COMPLETED", "ABORTED", "BLOCKED"), required=True
+    )
+    close_tree.add_argument("--reason", default="")
     run = commands.add_parser("run", help="Execute one active T1-T4 route")
     source = run.add_mutually_exclusive_group(required=True)
     source.add_argument("--request", type=Path)
@@ -5797,7 +6438,17 @@ def build_parser() -> argparse.ArgumentParser:
         "--agent-role", choices=sorted(governance.LEASE_ROLES), default="worker"
     )
     run.add_argument("--parent-lease-id")
-    run.add_argument("--nested-capacity-tokens", type=int, default=0)
+    run.add_argument("--capacity-contract", type=Path)
+    run.add_argument("--capacity-branch-id")
+    run.add_argument(
+        "--nested-capacity-tokens",
+        type=int,
+        default=0,
+        help=(
+            "Compatibility field; nonzero values are rejected in favor of a "
+            "validated capacity plan"
+        ),
+    )
     run.add_argument("--lease-seconds", type=int, default=900)
     run.add_argument("--expect-exact-output", help=argparse.SUPPRESS)
     return parser
@@ -5817,7 +6468,16 @@ def enforce_install_admission(
     A malformed, partial, symlinked, or stale journal therefore fails closed.
     """
 
-    if command not in {"run", "resume", "smoke"}:
+    if command not in {
+        "run",
+        "resume",
+        "smoke",
+        "open-tree",
+        "close-tree",
+        "skill-read",
+        "register-quality",
+        "check",
+    }:
         return
     if not journal_path.exists() and not journal_path.is_symlink():
         return
@@ -5887,6 +6547,14 @@ def main() -> int:
             if args.grader_timeout_seconds < 1:
                 parser.error("--grader-timeout-seconds must be positive")
             return register_quality(args)
+        if args.command == "capacity-plan":
+            return plan_parallel_capacity(args)
+        if args.command == "open-tree":
+            if not 1 <= args.lease_seconds <= 86_400:
+                parser.error("--lease-seconds must be between 1 and 86400")
+            return open_parallel_tree(args)
+        if args.command == "close-tree":
+            return close_parallel_tree(args)
         if args.command == "resume":
             return resume_phase(args)
         if bool(args.plan) != bool(args.phase_key):
@@ -5919,16 +6587,57 @@ def main() -> int:
             parser.error("--tool-cycle-cap cannot be negative")
         if args.wall_time_seconds < 1:
             parser.error("--wall-time-seconds must be positive")
+        if args.nested_capacity_tokens != 0:
+            parser.error(
+                "unbound descendant tokens are forbidden; use capacity-plan and open-tree"
+            )
+        if args.agent_role == "coordinator":
+            parser.error("routed coordinator runs are forbidden; use open-tree")
+        capacity_fields = (
+            args.parent_lease_id,
+            args.capacity_contract,
+            args.capacity_branch_id,
+        )
+        if args.parent_lease_id is not None:
+            if (
+                args.tree_id is None
+                or args.capacity_contract is None
+                or args.capacity_branch_id is None
+            ):
+                parser.error(
+                    "planned child runs require tree, parent, capacity contract, and branch"
+                )
+            if args.plan is None:
+                parser.error(
+                    "planned child runs require a verified workflow plan and dispatch packet"
+                )
+            if args.resumable:
+                parser.error("planned parallel branches cannot use checkpoint restart")
+        elif any(value is not None for value in capacity_fields[1:]):
+            parser.error("capacity contract and branch require a parent coordinator")
         tree_id = args.tree_id or f"dispatch-{uuid.uuid4().hex}"
+        capacity_contract = None
+        if args.capacity_contract is not None:
+            capacity_contract = governance.load_capacity_contract(
+                args.capacity_contract.expanduser().absolute(),
+                tree_id=tree_id,
+                source_commit=source_commit_for(args.cwd.expanduser().resolve()),
+            )
+            validate_trusted_capacity_snapshot(
+                capacity_contract["capacity_snapshot"], require_fresh=False
+            )
         reservation = governance.reserve_agent(
             tree_id=tree_id,
             role=args.agent_role,
             parent_lease_id=args.parent_lease_id,
             nested_capacity_tokens=args.nested_capacity_tokens,
             lease_seconds=args.lease_seconds,
+            capacity_contract=capacity_contract,
+            capacity_branch_id=args.capacity_branch_id,
         )
         lease = reservation["lease"]
         args._agent_lease = lease
+        args._capacity_contract = capacity_contract
         try:
             result = run_phase(args)
         except Exception as error:
@@ -5940,6 +6649,13 @@ def main() -> int:
             reservation,
             status="COMPLETED" if result == 0 else "BLOCKED",
             reason="dispatcher accepted phase" if result == 0 else "dispatcher rejected phase",
+            completion_evidence=(
+                governance.branch_completion_evidence(
+                    lease, getattr(args, "_dispatcher_receipt", {})
+                )
+                if result == 0 and args.capacity_branch_id is not None
+                else None
+            ),
         )
         # The execution artifact is printed by run_phase.  This short, immediate
         # receipt makes capacity release observable even when the worker output
