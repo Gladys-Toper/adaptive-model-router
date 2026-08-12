@@ -1,0 +1,41 @@
+{
+  "schema_version": 1,
+  "quality": {
+    "hard_constraint": true,
+    "incumbent_wins_ties": true,
+    "pareto_dimensions": [
+      "total_tokens",
+      "end_to_end_wall_time"
+    ]
+  },
+  "evidence": {
+    "default_ttl_seconds": 1209600,
+    "require_trusted_dispatcher_receipts": true,
+    "require_trusted_quality_provenance": true,
+    "require_exact_cross_cycle_bindings": true,
+    "holdouts_update_action_statistics": false
+  },
+  "promotion": {
+    "workflow_canary_windows": 2,
+    "fresh_qualification_required": true,
+    "canary_reports_are_evidence_derived": true
+  },
+  "exploration": {
+    "one_causal_variable_per_cycle": true,
+    "one_candidate_per_scheduled_run": true,
+    "conservative_current_family_only": true
+  },
+  "serendipity": {
+    "capacity_fraction": 0.1,
+    "replay_interval_cycles": 10,
+    "unrelated_holdout_families_required": 1,
+    "promotion_gate_bypass": false,
+    "retain_safe_informative_failures": true
+  },
+  "review": {
+    "max_remediation_passes": 1,
+    "compact_excerpt_bytes": 12000,
+    "t3_material_only": true,
+    "t4_terminal_read_only": true
+  }
+}

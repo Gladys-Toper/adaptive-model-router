@@ -1,0 +1,64 @@
+{
+  "schema_version": 1,
+  "source": "claude-code-harness-curated",
+  "captured_at": "2026-07-10T00:00:00Z",
+  "note": "Curated versioned snapshot of the Claude models selectable inside the Claude Code harness (Agent-tool aliases). Claude Code exposes no local model catalog file, so this file is the catalog source of truth for the router lab. New models arrive by updating this curated catalog from official Anthropic announcements; the first observation of a model here is a baseline, not a release event; and catalog metadata alone never replaces an incumbent assignment. captured_at, display_name, and description are excluded from semantic change detection.",
+  "models": [
+    {
+      "slug": "haiku",
+      "model_id": "claude-haiku-4-5-20251001",
+      "display_name": "Claude Haiku 4.5",
+      "description": "Fastest, lowest-cost Claude Code model; suited to bounded read-heavy and mechanical work.",
+      "provider": "anthropic",
+      "visible": true,
+      "selectable": true,
+      "input_modalities": ["text", "image"],
+      "supported_efforts": ["low", "medium", "high", "xhigh", "max"],
+      "context_window": 200000,
+      "capabilities": ["tool-use", "code-edit", "parallel-tool-calls", "subagent-dispatch"],
+      "instructions": null
+    },
+    {
+      "slug": "sonnet",
+      "model_id": "claude-sonnet-5",
+      "display_name": "Claude Sonnet 5",
+      "description": "Balanced Claude Code workhorse for contained implementation and verification.",
+      "provider": "anthropic",
+      "visible": true,
+      "selectable": true,
+      "input_modalities": ["text", "image"],
+      "supported_efforts": ["low", "medium", "high", "xhigh", "max"],
+      "context_window": 200000,
+      "capabilities": ["tool-use", "code-edit", "parallel-tool-calls", "subagent-dispatch"],
+      "instructions": null
+    },
+    {
+      "slug": "opus",
+      "model_id": "claude-opus-4-8",
+      "display_name": "Claude Opus 4.8",
+      "description": "Deep-reasoning Claude Code model for complex diagnosis and high-risk review.",
+      "provider": "anthropic",
+      "visible": true,
+      "selectable": true,
+      "input_modalities": ["text", "image"],
+      "supported_efforts": ["low", "medium", "high", "xhigh", "max"],
+      "context_window": 200000,
+      "capabilities": ["tool-use", "code-edit", "parallel-tool-calls", "subagent-dispatch"],
+      "instructions": null
+    },
+    {
+      "slug": "fable",
+      "model_id": "claude-fable-5",
+      "display_name": "Claude Fable 5",
+      "description": "Frontier Claude Code model for the hardest planning, architecture, and adjudication.",
+      "provider": "anthropic",
+      "visible": true,
+      "selectable": true,
+      "input_modalities": ["text", "image"],
+      "supported_efforts": ["low", "medium", "high", "xhigh", "max"],
+      "context_window": 200000,
+      "capabilities": ["tool-use", "code-edit", "parallel-tool-calls", "subagent-dispatch"],
+      "instructions": null
+    }
+  ]
+}

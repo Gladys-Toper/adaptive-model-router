@@ -1,0 +1,61 @@
+{
+  "schema_version": 1,
+  "policy_name": "adaptive-workflow.execution-budget-policy",
+  "policy_version": 6,
+  "cold_start_accounting": {
+    "tool_enabled_model_api_call_allowance": "tool_cycle_cap_plus_four",
+    "tool_mode_none_model_api_call_allowance": 1,
+    "context_growth_horizon": 2,
+    "work_allowance_scope": "phase_total",
+    "unobserved_provider_call_behavior": "record_within_independent_hard_limits"
+  },
+  "accepted_history": {
+    "quality_receipt_required": true,
+    "acceptance_rule": "all_registered_quality_receipts_pass",
+    "minimum_samples": 5,
+    "percentile": 0.9,
+    "headroom": 1.15,
+    "max_sample_age_seconds": 7776000,
+    "group_by": [
+      "workflow_id",
+      "workflow_version",
+      "phase_id",
+      "model",
+      "effort",
+      "tool_mode"
+    ]
+  },
+  "model_resource_weights": {
+    "haiku": {
+      "cost_weight": 0.5,
+      "quota_weight": 0.75
+    },
+    "sonnet": {
+      "cost_weight": 1.0,
+      "quota_weight": 1.0
+    },
+    "opus": {
+      "cost_weight": 2.0,
+      "quota_weight": 1.5
+    },
+    "fable": {
+      "cost_weight": 3.0,
+      "quota_weight": 2.0
+    }
+  },
+  "unknown_model_resource_weights": {
+    "cost_weight": 1.5,
+    "quota_weight": 1.5
+  },
+  "parallel_capacity": {
+    "snapshot_source": "local-host-plus-active-policy",
+    "snapshot_ttl_seconds": 900,
+    "provider_weight_ceiling": 6.0,
+    "host_logical_cpus_per_weight_unit": 2.0
+  },
+  "increase_contract": {
+    "contract_name": "adaptive-workflow.execution-budget-increase",
+    "contract_version": 1,
+    "review_workflow_id": "review.audit"
+  }
+}

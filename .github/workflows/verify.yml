@@ -1,0 +1,294 @@
+name: Verify published skills
+
+# Two guarantees for the published repository:
+#   1. `published-bytes` recomputes every sha256 + mode in SYNC-MANIFEST.json,
+#      so a hand-edit to the published tree (rather than a regeneration from the
+#      harness via scripts/publish_sync.py) fails closed.
+#   2. The per-platform jobs run each platform's deterministic offline suites
+#      directly from skills/<platform>/, so the published bytes are proven to
+#      run, not merely proven to match.
+#
+# Every job is offline: no model is dispatched, no live agent home is touched,
+# and all runtime state is written under isolated RUNNER_TEMP homes.  No job
+# consumes attacker-controllable event input.
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+concurrency:
+  group: published-verify-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  LC_ALL: C.UTF-8
+  PYTHONDONTWRITEBYTECODE: "1"
+  PYTHONHASHSEED: "0"
+  TZ: UTC
+
+jobs:
+  published-bytes:
+    name: Published bytes match SYNC-MANIFEST.json
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check out source without credentials
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Select Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Parse the installer
+        run: bash -n install.sh
+
+      - name: Recompute every published hash and mode
+        run: ./install.sh --verify-only
+
+      - name: Show the installer plan for each platform
+        run: |
+          ./install.sh --platform codex --dry-run
+          ./install.sh --platform claude --dry-run
+          ./install.sh --platform cursor --dry-run
+
+  codex:
+    name: Codex suites (3.12)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check out source without credentials
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Select Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Configure isolated runtime paths
+        shell: bash
+        run: |
+          printf '%s\n' "CODEX_HOME=${RUNNER_TEMP}/codex-home" >> "${GITHUB_ENV}"
+          printf '%s\n' "PYTHONPYCACHEPREFIX=${RUNNER_TEMP}/pycache" >> "${GITHUB_ENV}"
+
+      - name: Build isolated routing fixture
+        shell: bash
+        run: |
+          python - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          skill = Path("skills/codex/adaptive-model-router")
+          policy = json.loads(
+              (skill / "assets/default-policy.json").read_text(encoding="utf-8")
+          )
+          slugs = {
+              route["model"]
+              for tier, assignment in policy["tiers"].items()
+              if tier != "T0"
+              for route in [assignment, *assignment.get("fallbacks", [])]
+          }
+          models = []
+          for slug in sorted(slugs):
+              instruction = f"deterministic hosted-CI fixture for {slug}"
+              models.append(
+                  {
+                      "slug": slug,
+                      "provider": policy["constraints"]["allowed_provider"],
+                      "visibility": "list",
+                      "supported_reasoning_levels": [
+                          {"effort": effort}
+                          for effort in ("low", "medium", "high", "ultra")
+                      ],
+                      "input_modalities": ["text", "image"],
+                      "shell_type": "shell_command",
+                      "apply_patch_tool_type": "freeform",
+                      "supports_parallel_tool_calls": True,
+                      "supports_search_tool": True,
+                      "supported_in_api": True,
+                      "context_window": 272000,
+                      "max_context_window": 272000,
+                      "effective_context_window_percent": 95,
+                      "truncation_policy": {"mode": "tokens", "limit": 10000},
+                      "comp_hash": "hosted-ci",
+                      "multi_agent_version": "v2",
+                      "tool_mode": "code_mode_only",
+                      "web_search_tool_type": "text_and_image",
+                      "experimental_supported_tools": [],
+                      "service_tiers": [
+                          {"id": service_tier}
+                          for service_tier in policy["constraints"][
+                              "allowed_service_tiers"
+                          ]
+                      ],
+                      "additional_speed_tiers": [],
+                      "supports_image_detail_original": True,
+                      "supports_reasoning_summaries": True,
+                      "support_verbosity": True,
+                      "use_responses_lite": True,
+                      "base_instructions": instruction,
+                      "model_messages": {"instructions_template": instruction},
+                  }
+              )
+          codex_home = Path(os.environ["CODEX_HOME"])
+          skills_home = codex_home / "skills"
+          skills_home.mkdir(parents=True, exist_ok=True)
+          (skills_home / "adaptive-model-router").symlink_to(
+              Path.cwd() / skill, target_is_directory=True
+          )
+          (codex_home / "models_cache.json").write_text(
+              json.dumps(
+                  {
+                      "fetched_at": "2026-07-16T00:00:00Z",
+                      "etag": "hosted-ci",
+                      "client_version": "hosted-ci",
+                      "models": models,
+                  },
+                  sort_keys=True,
+              )
+              + "\n",
+              encoding="utf-8",
+          )
+          PY
+          python skills/codex/adaptive-model-router/scripts/router_lab.py sync-agents
+          python skills/codex/adaptive-model-router/scripts/router_lab.py refresh
+
+      - name: Compile sources
+        run: python -m compileall -q skills/codex
+
+      - name: Test model router
+        run: python skills/codex/adaptive-model-router/scripts/test_router_lab.py
+
+      - name: Validate workflow catalog
+        run: python skills/codex/adaptive-workflow-router/scripts/workflow_plan.py validate
+
+      - name: Test workflow planner
+        run: python skills/codex/adaptive-workflow-router/scripts/test_workflow_plan.py
+
+      - name: Test workflow dispatcher
+        run: python skills/codex/adaptive-workflow-router/scripts/test_workflow_dispatch.py
+
+      - name: Test agent-tree governance
+        run: python skills/codex/adaptive-workflow-router/scripts/test_agent_governance.py
+
+      - name: Test persistent learning loop
+        run: python skills/codex/adaptive-workflow-router/scripts/test_learning_loop.py
+
+      - name: Confirm tests did not mutate published source
+        run: |
+          git diff --exit-code
+          test -z "$(git status --porcelain --untracked-files=all)"
+
+  claude:
+    name: Claude suites (3.12)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check out source without credentials
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Select Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Configure isolated runtime paths
+        shell: bash
+        run: |
+          mkdir -p "${RUNNER_TEMP}/claude-home"
+          printf '%s\n' "CLAUDE_CONFIG_DIR=${RUNNER_TEMP}/claude-home" >> "${GITHUB_ENV}"
+          printf '%s\n' "PYTHONPYCACHEPREFIX=${RUNNER_TEMP}/pycache" >> "${GITHUB_ENV}"
+
+      - name: Compile sources
+        run: python -m compileall -q skills/claude
+
+      - name: Test model router
+        run: python skills/claude/adaptive-model-router/scripts/test_router_lab.py
+
+      - name: Seed profiles and baseline the curated catalog
+        run: |
+          python skills/claude/adaptive-model-router/scripts/router_lab.py sync-agents
+          python skills/claude/adaptive-model-router/scripts/router_lab.py refresh --stage-new
+          python skills/claude/adaptive-model-router/scripts/router_lab.py status
+
+      - name: Validate workflow catalog
+        run: python skills/claude/adaptive-workflow-router/scripts/workflow_plan.py validate
+
+      - name: Test workflow planner
+        run: python skills/claude/adaptive-workflow-router/scripts/test_workflow_plan.py
+
+      - name: Test agent-tree governance
+        run: python skills/claude/adaptive-workflow-router/scripts/test_agent_governance.py
+
+      - name: Test workflow dispatcher
+        run: python skills/claude/adaptive-workflow-router/scripts/test_workflow_dispatch.py
+
+      - name: Check dispatcher health gate
+        run: python skills/claude/adaptive-workflow-router/scripts/workflow_dispatch.py check
+
+      - name: Test persistent learning loop
+        run: python skills/claude/adaptive-workflow-router/scripts/test_learning_loop.py
+
+      - name: Check learning-loop health and deterministic simulation
+        run: |
+          python skills/claude/adaptive-workflow-router/scripts/learning_loop.py doctor
+          python skills/claude/adaptive-workflow-router/scripts/learning_loop.py simulate
+
+      - name: Confirm tests did not mutate published source
+        run: |
+          git diff --exit-code
+          test -z "$(git status --porcelain --untracked-files=all)"
+
+  cursor:
+    name: Cursor suites (3.12)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check out source without credentials
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Select Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Configure isolated runtime paths
+        shell: bash
+        run: |
+          printf '%s\n' "CURSOR_HOME=${RUNNER_TEMP}/cursor-home" >> "${GITHUB_ENV}"
+          printf '%s\n' "ADAPTIVE_MODEL_ROUTER_HOME=${RUNNER_TEMP}/cursor-home/adaptive-model-router" >> "${GITHUB_ENV}"
+          printf '%s\n' "PYTHONPYCACHEPREFIX=${RUNNER_TEMP}/pycache" >> "${GITHUB_ENV}"
+
+      - name: Compile sources
+        run: python -m compileall -q skills/cursor
+
+      - name: Test model router
+        run: python skills/cursor/adaptive-model-router/scripts/test_router_lab.py
+
+      - name: Validate workflow catalog
+        run: >-
+          python skills/cursor/adaptive-workflow-router/scripts/workflow_plan.py
+          --catalog skills/cursor/adaptive-workflow-router/assets/workflows.json
+          validate
+
+      - name: Test workflow planner
+        run: python skills/cursor/adaptive-workflow-router/scripts/test_workflow_plan.py
+
+      - name: Confirm tests did not mutate published source
+        run: |
+          git diff --exit-code
+          test -z "$(git status --porcelain --untracked-files=all)"

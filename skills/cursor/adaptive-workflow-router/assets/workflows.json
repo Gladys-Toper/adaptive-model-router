@@ -1,0 +1,766 @@
+{
+  "schema_version": 1,
+  "research_snapshot": "2026-07-09",
+  "route_contract_version": 1,
+  "route_defaults": {
+    "mutation": "none",
+    "scope": "local",
+    "ambiguity": "none",
+    "risk_level": "low",
+    "risk_scope": "none",
+    "risk_tags": [],
+    "visual_required": false,
+    "current_info_required": false,
+    "external_action": false
+  },
+  "patterns": [
+    "chain",
+    "route",
+    "fan_out",
+    "gather",
+    "orchestrator_workers",
+    "evaluator_optimizer",
+    "human_gate",
+    "bounded_agent_loop"
+  ],
+  "workflows": {
+    "coding.change": {
+      "version": 1,
+      "application": "coding",
+      "aliases": ["code", "implementation", "pr"],
+      "summary": "Inspect, design, implement, verify, review, and optionally deliver a code change.",
+      "evaluation_family": "coding.change",
+      "composition_terminal_phase": "review",
+      "terminal_artifacts": ["change_summary", "verification_record", "review_record"],
+      "phases": [
+        {
+          "id": "frame",
+          "pattern": "chain",
+          "depends_on": [],
+          "execution": "route",
+          "route": {"activity": "frame", "ambiguity": "bounded", "risk_level": "moderate", "risk_scope": "judgment"},
+          "produces": ["change_contract"],
+          "exit_gate": ["objective, constraints, acceptance checks, and authorization boundary are explicit"]
+        },
+        {
+          "id": "inspect",
+          "pattern": "fan_out",
+          "depends_on": ["frame"],
+          "execution": "route",
+          "route": {"activity": "inspect", "risk_scope": "evidence"},
+          "produces": ["repository_evidence"],
+          "exit_gate": ["relevant instructions, files, call paths, and existing tests are identified"]
+        },
+        {
+          "id": "design",
+          "pattern": "gather",
+          "depends_on": ["inspect"],
+          "execution": "route",
+          "route": {"activity": "design", "scope": "multi_file", "ambiguity": "bounded", "risk_level": "moderate", "risk_scope": "judgment"},
+          "produces": ["implementation_plan"],
+          "exit_gate": ["the smallest coherent change and its regression strategy are specified"]
+        },
+        {
+          "id": "implement",
+          "pattern": "chain",
+          "depends_on": ["design"],
+          "execution": "route",
+          "route": {"activity": "implement", "mutation": "reversible", "scope": "multi_file", "ambiguity": "bounded", "risk_level": "moderate", "risk_scope": "mutation", "risk_tags": ["build"]},
+          "produces": ["change_set"],
+          "exit_gate": ["requested behavior is implemented without unrelated edits"]
+        },
+        {
+          "id": "verify_exact",
+          "pattern": "chain",
+          "depends_on": ["implement"],
+          "execution": "route",
+          "route": {"activity": "exact_check"},
+          "produces": ["verification_record"],
+          "exit_gate": ["declared tests, type checks, linters, builds, or exact checks have recorded outcomes"]
+        },
+        {
+          "id": "diagnose_variance",
+          "pattern": "bounded_agent_loop",
+          "depends_on": ["verify_exact"],
+          "condition": "verification_failed",
+          "condition_mode": "runtime",
+          "max_iterations": 2,
+          "execution": "route",
+          "route": {"activity": "diagnose", "mutation": "reversible", "scope": "multi_file", "ambiguity": "bounded", "risk_level": "moderate", "risk_scope": "mutation", "risk_tags": ["build"]},
+          "produces": ["diagnosis_record", "repair_verification_record"],
+          "exit_gate": ["the failed check is diagnosed, the smallest correction is applied within existing authority, and exact checks pass; an unresolved result blocks review"]
+        },
+        {
+          "id": "review",
+          "pattern": "evaluator_optimizer",
+          "depends_on": ["verify_exact", "diagnose_variance"],
+          "max_iterations": 2,
+          "execution": "route",
+          "route": {"activity": "review", "scope": "multi_file", "ambiguity": "bounded", "risk_level": "moderate", "risk_scope": "judgment"},
+          "produces": ["review_record", "change_summary"],
+          "exit_gate": ["diff, regression evidence, edge cases, and instruction compliance have been independently checked"]
+        },
+        {
+          "id": "prepare_delivery",
+          "pattern": "chain",
+          "depends_on": ["review"],
+          "condition": "delivery_requested",
+          "condition_mode": "input",
+          "execution": "route",
+          "route": {"activity": "prepare_external"},
+          "produces": ["delivery_packet"],
+          "exit_gate": ["branch, title, body, evidence, and exact requested destination are prepared"]
+        },
+        {
+          "id": "authorize_delivery",
+          "pattern": "human_gate",
+          "depends_on": ["prepare_delivery"],
+          "condition": "delivery_requested",
+          "condition_mode": "input",
+          "execution": "parent_gate",
+          "authority_for": "execute_delivery",
+          "produces": ["delivery_authorization"],
+          "exit_gate": ["the user request or an explicit parent decision authorizes the exact delivery action"]
+        },
+        {
+          "id": "execute_delivery",
+          "pattern": "chain",
+          "depends_on": ["authorize_delivery"],
+          "condition": "delivery_requested",
+          "condition_mode": "input",
+          "execution": "parent_action",
+          "action_source": "delivery_packet",
+          "produces": ["delivery_receipt"],
+          "exit_gate": ["the parent records the external system receipt"]
+        },
+        {
+          "id": "poll_delivery",
+          "pattern": "bounded_agent_loop",
+          "depends_on": ["execute_delivery"],
+          "condition": "delivery_requested",
+          "condition_mode": "input",
+          "max_iterations": 12,
+          "execution": "route",
+          "route": {"activity": "poll"},
+          "produces": ["delivery_status"],
+          "exit_gate": ["the external status reaches a terminal state or the polling bound is reached"]
+        }
+      ]
+    },
+    "research.synthesis": {
+      "version": 1,
+      "application": "research",
+      "aliases": ["deep-research", "investigation", "evidence"],
+      "summary": "Frame a source policy, gather independent evidence lanes, synthesize, adjudicate, and citation-check a report.",
+      "evaluation_family": "research.synthesis",
+      "composition_terminal_phase": "deliver",
+      "terminal_artifacts": ["research_report", "claim_source_map", "limitations"],
+      "phases": [
+        {
+          "id": "frame",
+          "pattern": "chain",
+          "depends_on": [],
+          "execution": "route",
+          "route": {"activity": "frame", "ambiguity": "bounded", "risk_level": "moderate", "risk_scope": "judgment"},
+          "produces": ["research_contract"],
+          "exit_gate": ["question, scope, currentness date, source hierarchy, exclusions, and output format are frozen"]
+        },
+        {
+          "id": "decompose",
+          "pattern": "orchestrator_workers",
+          "depends_on": ["frame"],
+          "execution": "route",
+          "route": {"activity": "plan", "ambiguity": "high", "risk_level": "moderate", "risk_scope": "judgment"},
+          "produces": ["research_lanes"],
+          "exit_gate": ["independent research lanes and their stopping criteria are defined"]
+        },
+        {
+          "id": "retrieve",
+          "pattern": "fan_out",
+          "depends_on": ["decompose"],
+          "execution": "route",
+          "route": {"activity": "retrieve", "risk_scope": "evidence", "current_info_required": true},
+          "produces": ["source_bundle"],
+          "exit_gate": ["each lane returns primary-source metadata, relevant evidence, and unresolved questions"]
+        },
+        {
+          "id": "extract",
+          "pattern": "gather",
+          "depends_on": ["retrieve"],
+          "execution": "route",
+          "route": {"activity": "summarize", "risk_scope": "evidence"},
+          "produces": ["evidence_table"],
+          "exit_gate": ["facts, dates, source quality, direct support, and conflicts are normalized"]
+        },
+        {
+          "id": "synthesize",
+          "pattern": "orchestrator_workers",
+          "depends_on": ["extract"],
+          "execution": "route",
+          "route": {"activity": "synthesize", "scope": "cross_system", "ambiguity": "high", "risk_level": "moderate", "risk_scope": "judgment"},
+          "produces": ["draft_report"],
+          "exit_gate": ["the answer distinguishes sourced facts, inference, uncertainty, and missing evidence"]
+        },
+        {
+          "id": "adjudicate",
+          "pattern": "evaluator_optimizer",
+          "depends_on": ["synthesize"],
+          "condition": "material_conflict_or_gap",
+          "condition_mode": "runtime",
+          "max_iterations": 2,
+          "execution": "route",
+          "route": {"activity": "adjudicate", "ambiguity": "high", "risk_level": "high", "risk_scope": "judgment"},
+          "produces": ["conflict_record"],
+          "exit_gate": ["material disagreements are resolved, bounded, or clearly presented"]
+        },
+        {
+          "id": "citation_check",
+          "pattern": "evaluator_optimizer",
+          "depends_on": ["synthesize", "adjudicate"],
+          "max_iterations": 2,
+          "execution": "route",
+          "route": {"activity": "verify", "ambiguity": "bounded", "risk_level": "moderate", "risk_scope": "evidence"},
+          "produces": ["claim_source_map", "limitations"],
+          "exit_gate": ["every material current claim is entailed by a cited source and links resolve"]
+        },
+        {
+          "id": "deliver",
+          "pattern": "chain",
+          "depends_on": ["citation_check"],
+          "execution": "route",
+          "route": {"activity": "draft", "ambiguity": "bounded", "risk_level": "moderate", "risk_scope": "judgment"},
+          "produces": ["research_report"],
+          "exit_gate": ["the report answers the frozen question and preserves citations, caveats, and date context"]
+        }
+      ]
+    },
+    "planning.decision": {
+      "version": 1,
+      "application": "planning",
+      "aliases": ["strategy", "decision", "roadmap"],
+      "summary": "Turn an objective into evidence-backed alternatives, tradeoffs, a selected plan, and a stress-tested execution sequence.",
+      "evaluation_family": "planning.decision",
+      "composition_terminal_phase": "operationalize",
+      "terminal_artifacts": ["decision_record", "execution_plan", "risk_register"],
+      "phases": [
+        {
+          "id": "frame",
+          "pattern": "chain",
+          "depends_on": [],
+          "execution": "route",
+          "route": {"activity": "frame", "ambiguity": "bounded", "risk_level": "moderate", "risk_scope": "judgment"},
+          "produces": ["planning_contract"],
+          "exit_gate": ["objective, decision owner, deadline, constraints, success metrics, and non-goals are explicit"]
+        },
+        {
+          "id": "constraints",
+          "pattern": "fan_out",
+          "depends_on": ["frame"],
+          "execution": "route",
+          "route": {"activity": "inspect", "risk_scope": "evidence"},
+          "produces": ["constraint_evidence"],
+          "exit_gate": ["hard constraints, assumptions, dependencies, and unknowns are separated"]
+        },
+        {
+          "id": "alternatives",
+          "pattern": "orchestrator_workers",
+          "depends_on": ["constraints"],
+          "execution": "route",
+          "route": {"activity": "plan", "scope": "single_system", "ambiguity": "high", "risk_level": "moderate", "risk_scope": "judgment"},
+          "produces": ["option_set"],
+          "exit_gate": ["multiple materially distinct options include a status-quo baseline"]
+        },
+        {
+          "id": "evaluate",
+          "pattern": "fan_out",
+          "depends_on": ["alternatives"],
+          "execution": "route",
+          "route": {"activity": "analyze", "ambiguity": "high", "risk_level": "moderate", "risk_scope": "judgment"},
+          "produces": ["tradeoff_matrix"],
+          "exit_gate": ["options are scored against the same criteria with uncertainty visible"]
+        },
+        {
+          "id": "select",
+          "pattern": "gather",
+          "depends_on": ["evaluate"],
+          "execution": "route",
+          "route": {"activity": "adjudicate", "ambiguity": "high", "risk_level": "high", "risk_scope": "judgment"},
+          "produces": ["decision_record"],
+          "exit_gate": ["recommendation, rationale, dissent, reversible assumptions, and decision owner are recorded"]
+        },
+        {
+          "id": "stress_test",
+          "pattern": "evaluator_optimizer",
+          "depends_on": ["select"],
+          "max_iterations": 2,
+          "execution": "route",
+          "route": {"activity": "review", "ambiguity": "high", "risk_level": "high", "risk_scope": "judgment"},
+          "produces": ["risk_register"],
+          "exit_gate": ["failure modes, leading indicators, kill criteria, and mitigations are concrete"]
+        },
+        {
+          "id": "authorize",
+          "pattern": "human_gate",
+          "depends_on": ["stress_test"],
+          "condition": "consequential_plan",
+          "condition_mode": "input",
+          "execution": "parent_gate",
+          "authority_for": "operationalize",
+          "produces": ["decision_authorization"],
+          "exit_gate": ["the named decision owner approves, rejects, or revises the recommendation"]
+        },
+        {
+          "id": "operationalize",
+          "pattern": "chain",
+          "depends_on": ["stress_test", "authorize"],
+          "execution": "route",
+          "route": {"activity": "plan", "scope": "cross_system", "ambiguity": "bounded", "risk_level": "high", "risk_scope": "judgment"},
+          "produces": ["execution_plan"],
+          "exit_gate": ["sequence, owners, dependencies, checkpoints, verification, and rollback conditions are explicit"]
+        }
+      ]
+    },
+    "debugging.incident": {
+      "version": 1,
+      "application": "debugging",
+      "aliases": ["bug", "incident", "triage"],
+      "summary": "Observe, reproduce, form hypotheses, run bounded tests, diagnose, mitigate when authorized, and verify recovery.",
+      "evaluation_family": "debugging.incident",
+      "composition_terminal_phase": "report",
+      "terminal_artifacts": ["diagnosis", "incident_report"],
+      "phases": [
+        {
+          "id": "observe",
+          "pattern": "fan_out",
+          "depends_on": [],
+          "execution": "route",
+          "route": {"activity": "inspect", "risk_scope": "evidence"},
+          "produces": ["symptom_record"],
+          "exit_gate": ["actual versus expected behavior, timeline, scope, and evidence locations are recorded"]
+        },
+        {
+          "id": "reproduce",
+          "pattern": "chain",
+          "depends_on": ["observe"],
+          "execution": "route",
+          "route": {"activity": "exact_check"},
+          "produces": ["reproduction_record"],
+          "exit_gate": ["a deterministic reproducer succeeds or the non-reproducibility boundary is documented"]
+        },
+        {
+          "id": "hypothesize",
+          "pattern": "orchestrator_workers",
+          "depends_on": ["reproduce"],
+          "execution": "route",
+          "route": {"activity": "diagnose", "ambiguity": "high", "risk_level": "moderate", "risk_scope": "judgment"},
+          "produces": ["ranked_hypotheses"],
+          "exit_gate": ["competing hypotheses have predicted observations and falsification tests"]
+        },
+        {
+          "id": "test_hypotheses",
+          "pattern": "bounded_agent_loop",
+          "depends_on": ["hypothesize"],
+          "max_iterations": 3,
+          "execution": "route",
+          "route": {"activity": "design", "ambiguity": "bounded", "risk_level": "moderate", "risk_scope": "judgment"},
+          "produces": ["experiment_record"],
+          "exit_gate": ["tests discriminate among hypotheses without expanding the mutation scope"]
+        },
+        {
+          "id": "diagnose",
+          "pattern": "gather",
+          "depends_on": ["test_hypotheses"],
+          "execution": "route",
+          "route": {"activity": "adjudicate", "ambiguity": "high", "risk_level": "high", "risk_scope": "judgment"},
+          "produces": ["diagnosis"],
+          "exit_gate": ["root cause or most-supported causal boundary is tied to evidence and confidence"]
+        },
+        {
+          "id": "mitigate",
+          "pattern": "chain",
+          "depends_on": ["diagnose"],
+          "condition": "fix_requested",
+          "condition_mode": "input",
+          "execution": "route",
+          "route": {"activity": "implement", "mutation": "reversible", "scope": "multi_file", "ambiguity": "bounded", "risk_level": "moderate", "risk_scope": "mutation"},
+          "produces": ["mitigation"],
+          "exit_gate": ["the smallest authorized mitigation addresses the diagnosed cause"]
+        },
+        {
+          "id": "verify",
+          "pattern": "chain",
+          "depends_on": ["mitigate"],
+          "condition": "fix_requested",
+          "condition_mode": "input",
+          "execution": "route",
+          "route": {"activity": "exact_check"},
+          "produces": ["verification_record"],
+          "exit_gate": ["reproducer passes, regressions pass, and observed state matches the recovery target"]
+        },
+        {
+          "id": "report",
+          "pattern": "chain",
+          "depends_on": ["diagnose", "verify"],
+          "execution": "route",
+          "route": {"activity": "summarize", "ambiguity": "bounded", "risk_level": "moderate", "risk_scope": "judgment"},
+          "produces": ["incident_report"],
+          "exit_gate": ["impact, evidence, cause, actions, residual risk, and verification when a fix was requested are explicit"]
+        }
+      ]
+    },
+    "review.audit": {
+      "version": 1,
+      "application": "review",
+      "aliases": ["audit", "code-review", "quality"],
+      "summary": "Apply a frozen rubric, run mechanical checks, inspect independently, validate findings, and report only actionable evidence.",
+      "evaluation_family": "review.audit",
+      "composition_terminal_phase": "report",
+      "terminal_artifacts": ["validated_findings", "review_report"],
+      "phases": [
+        {
+          "id": "scope",
+          "pattern": "chain",
+          "depends_on": [],
+          "execution": "route",
+          "route": {"activity": "frame", "ambiguity": "bounded", "risk_level": "moderate", "risk_scope": "judgment"},
+          "produces": ["review_contract"],
+          "exit_gate": ["target revision, rubric, severity scale, exclusions, and evidence standard are frozen"]
+        },
+        {
+          "id": "mechanical_checks",
+          "pattern": "fan_out",
+          "depends_on": ["scope"],
+          "execution": "route",
+          "route": {"activity": "exact_check"},
+          "produces": ["mechanical_results"],
+          "exit_gate": ["available tests, static checks, schemas, and exact policy checks have recorded outcomes"]
+        },
+        {
+          "id": "inspect",
+          "pattern": "fan_out",
+          "depends_on": ["scope"],
+          "execution": "route",
+          "route": {"activity": "inspect", "risk_scope": "evidence"},
+          "produces": ["inspection_evidence"],
+          "exit_gate": ["changed behavior, relevant context, and affected call paths are traced"]
+        },
+        {
+          "id": "adversarial_probe",
+          "pattern": "orchestrator_workers",
+          "depends_on": ["mechanical_checks", "inspect"],
+          "execution": "route",
+          "route": {"activity": "review", "scope": "multi_file", "ambiguity": "high", "risk_level": "high", "risk_scope": "judgment"},
+          "produces": ["candidate_findings"],
+          "exit_gate": ["independent lenses cover correctness, regressions, security, data, and operability as applicable"]
+        },
+        {
+          "id": "validate_findings",
+          "pattern": "evaluator_optimizer",
+          "depends_on": ["adversarial_probe"],
+          "max_iterations": 2,
+          "execution": "route",
+          "route": {"activity": "verify", "ambiguity": "bounded", "risk_level": "high", "risk_scope": "evidence"},
+          "produces": ["validated_findings"],
+          "exit_gate": ["each finding has a tight location, causal explanation, reproducible trigger, and bounded fix direction"]
+        },
+        {
+          "id": "adjudicate",
+          "pattern": "gather",
+          "depends_on": ["validate_findings"],
+          "execution": "route",
+          "route": {"activity": "adjudicate", "ambiguity": "high", "risk_level": "high", "risk_scope": "judgment"},
+          "produces": ["finding_decisions"],
+          "exit_gate": ["duplicates and unsupported findings are removed and severities are calibrated"]
+        },
+        {
+          "id": "report",
+          "pattern": "chain",
+          "depends_on": ["adjudicate"],
+          "execution": "route",
+          "route": {"activity": "draft", "ambiguity": "bounded", "risk_level": "moderate", "risk_scope": "judgment"},
+          "produces": ["review_report"],
+          "exit_gate": ["actionable findings lead; a clean result makes no unsupported completeness claim"]
+        }
+      ]
+    },
+    "data.analysis": {
+      "version": 1,
+      "application": "data",
+      "aliases": ["analytics", "dataset", "statistics"],
+      "summary": "Define the metric, inventory and validate data, transform reproducibly, analyze, stress-test, visualize, and report.",
+      "evaluation_family": "data.analysis",
+      "composition_terminal_phase": "report",
+      "terminal_artifacts": ["analysis_report", "reproducible_pipeline", "quality_record"],
+      "phases": [
+        {
+          "id": "frame",
+          "pattern": "chain",
+          "depends_on": [],
+          "execution": "route",
+          "route": {"activity": "frame", "ambiguity": "bounded", "risk_level": "moderate", "risk_scope": "judgment"},
+          "produces": ["analysis_contract"],
+          "exit_gate": ["question, population, units, metric definitions, decision use, and acceptance checks are explicit"]
+        },
+        {
+          "id": "inventory",
+          "pattern": "fan_out",
+          "depends_on": ["frame"],
+          "execution": "route",
+          "route": {"activity": "inspect", "risk_scope": "evidence"},
+          "produces": ["data_inventory"],
+          "exit_gate": ["files, schemas, provenance, join keys, quality issues, and sensitive fields are recorded"]
+        },
+        {
+          "id": "validate_inputs",
+          "pattern": "chain",
+          "depends_on": ["inventory"],
+          "execution": "route",
+          "route": {"activity": "exact_check"},
+          "produces": ["quality_record"],
+          "exit_gate": ["schema, types, uniqueness, missingness, ranges, and join cardinality checks are recorded"]
+        },
+        {
+          "id": "transform",
+          "pattern": "chain",
+          "depends_on": ["validate_inputs"],
+          "execution": "route",
+          "route": {"activity": "execute_runbook", "mutation": "reversible", "scope": "single_system", "ambiguity": "bounded", "risk_level": "moderate", "risk_scope": "mutation", "risk_tags": ["data_shape"]},
+          "produces": ["reproducible_pipeline", "analysis_dataset"],
+          "exit_gate": ["transformations are scripted, reviewable, and preserve the original inputs"]
+        },
+        {
+          "id": "analyze",
+          "pattern": "orchestrator_workers",
+          "depends_on": ["transform"],
+          "execution": "route",
+          "route": {"activity": "analyze", "ambiguity": "bounded", "risk_level": "moderate", "risk_scope": "judgment"},
+          "produces": ["analysis_results"],
+          "exit_gate": ["calculations answer the framed question without invented values or keys"]
+        },
+        {
+          "id": "robustness",
+          "pattern": "evaluator_optimizer",
+          "depends_on": ["analyze"],
+          "max_iterations": 2,
+          "execution": "route",
+          "route": {"activity": "review", "ambiguity": "high", "risk_level": "high", "risk_scope": "judgment"},
+          "produces": ["robustness_record"],
+          "exit_gate": ["sensitivity, leakage, confounding, edge cases, and alternative explanations are tested"]
+        },
+        {
+          "id": "visualize",
+          "pattern": "chain",
+          "depends_on": ["robustness"],
+          "execution": "route",
+          "route": {"activity": "draft", "visual_required": true, "risk_level": "moderate", "risk_scope": "judgment"},
+          "produces": ["visual_artifacts"],
+          "exit_gate": ["charts are inspected for labels, scales, units, legibility, and faithful encoding"]
+        },
+        {
+          "id": "report",
+          "pattern": "gather",
+          "depends_on": ["visualize"],
+          "execution": "route",
+          "route": {"activity": "synthesize", "ambiguity": "bounded", "risk_level": "moderate", "risk_scope": "judgment"},
+          "produces": ["analysis_report"],
+          "exit_gate": ["results, method, provenance, uncertainty, limitations, and reproducibility paths are present"]
+        }
+      ]
+    },
+    "writing.document": {
+      "version": 1,
+      "application": "writing",
+      "aliases": ["document", "memo", "content"],
+      "summary": "Create a source-grounded brief, outline, draft, critique, revision, factual check, and optional publication packet.",
+      "evaluation_family": "writing.document",
+      "composition_terminal_phase": "fact_check",
+      "terminal_artifacts": ["final_document", "quality_record"],
+      "phases": [
+        {
+          "id": "brief",
+          "pattern": "chain",
+          "depends_on": [],
+          "execution": "route",
+          "route": {"activity": "frame", "ambiguity": "bounded", "risk_level": "moderate", "risk_scope": "judgment"},
+          "produces": ["writing_brief"],
+          "exit_gate": ["audience, purpose, voice, format, sources, boundaries, and approval owner are explicit"]
+        },
+        {
+          "id": "gather",
+          "pattern": "fan_out",
+          "depends_on": ["brief"],
+          "execution": "route",
+          "route": {"activity": "retrieve", "risk_scope": "evidence"},
+          "produces": ["source_bundle"],
+          "exit_gate": ["required source material and provenance are available without silently changing voice constraints"]
+        },
+        {
+          "id": "outline",
+          "pattern": "chain",
+          "depends_on": ["gather"],
+          "execution": "route",
+          "route": {"activity": "plan", "ambiguity": "bounded", "risk_level": "moderate", "risk_scope": "judgment"},
+          "produces": ["outline"],
+          "exit_gate": ["the structure covers the brief and assigns evidence to claims"]
+        },
+        {
+          "id": "draft",
+          "pattern": "chain",
+          "depends_on": ["outline"],
+          "execution": "route",
+          "route": {"activity": "draft", "ambiguity": "bounded", "risk_level": "moderate", "risk_scope": "judgment"},
+          "produces": ["draft_document"],
+          "exit_gate": ["a complete draft follows the approved structure and source boundaries"]
+        },
+        {
+          "id": "critique_revise",
+          "pattern": "evaluator_optimizer",
+          "depends_on": ["draft"],
+          "max_iterations": 2,
+          "execution": "route",
+          "route": {"activity": "review", "ambiguity": "bounded", "risk_level": "moderate", "risk_scope": "judgment"},
+          "produces": ["revised_document", "quality_record"],
+          "exit_gate": ["a separate fixed rubric checks argument, voice, clarity, completeness, and format"]
+        },
+        {
+          "id": "fact_check",
+          "pattern": "chain",
+          "depends_on": ["critique_revise"],
+          "execution": "route",
+          "route": {"activity": "verify", "ambiguity": "bounded", "risk_level": "moderate", "risk_scope": "evidence", "current_info_required": true},
+          "produces": ["final_document"],
+          "exit_gate": ["material factual claims, citations, links, names, dates, and figures are verified"]
+        },
+        {
+          "id": "prepare_publication",
+          "pattern": "chain",
+          "depends_on": ["fact_check"],
+          "condition": "publication_requested",
+          "condition_mode": "input",
+          "execution": "route",
+          "route": {"activity": "prepare_external"},
+          "produces": ["publication_packet"],
+          "exit_gate": ["destination, final content, recipients, subject, and attachments are exact"]
+        },
+        {
+          "id": "authorize_publication",
+          "pattern": "human_gate",
+          "depends_on": ["prepare_publication"],
+          "condition": "publication_requested",
+          "condition_mode": "input",
+          "execution": "parent_gate",
+          "authority_for": "publish",
+          "produces": ["publication_authorization"],
+          "exit_gate": ["the user or named owner approves the exact external publication"]
+        },
+        {
+          "id": "publish",
+          "pattern": "chain",
+          "depends_on": ["authorize_publication"],
+          "condition": "publication_requested",
+          "condition_mode": "input",
+          "execution": "parent_action",
+          "action_source": "publication_packet",
+          "produces": ["publication_receipt"],
+          "exit_gate": ["the parent records the external system receipt"]
+        }
+      ]
+    },
+    "operations.release": {
+      "version": 2,
+      "application": "operations",
+      "aliases": ["release", "deploy", "runbook"],
+      "summary": "Preflight, plan, dry-run, authorize, execute through a single mutation owner, poll, verify, and close an operation.",
+      "evaluation_family": "operations.release",
+      "composition_terminal_phase": "close",
+      "terminal_artifacts": ["operation_receipt", "verification_record", "operations_report"],
+      "phases": [
+        {
+          "id": "preflight",
+          "pattern": "fan_out",
+          "depends_on": [],
+          "execution": "route",
+          "route": {"activity": "inspect", "risk_level": "high", "risk_scope": "evidence", "risk_tags": ["production", "release"]},
+          "produces": ["preflight_record"],
+          "exit_gate": ["target, current state, policy, approvals, rollback, observability, and blast radius are known"]
+        },
+        {
+          "id": "plan",
+          "pattern": "gather",
+          "depends_on": ["preflight"],
+          "execution": "route",
+          "route": {"activity": "release", "scope": "cross_system", "ambiguity": "bounded", "risk_level": "high", "risk_scope": "authority", "risk_tags": ["production", "release"]},
+          "produces": ["operation_plan"],
+          "exit_gate": ["scope, exact steps, single mutation owner, abort criteria, rollback, and verification are explicit"]
+        },
+        {
+          "id": "dry_run",
+          "pattern": "chain",
+          "depends_on": ["plan"],
+          "execution": "route",
+          "route": {"activity": "execute_runbook", "mutation": "none", "risk_level": "high", "risk_scope": "evidence", "risk_tags": ["production", "release"]},
+          "produces": ["dry_run_record"],
+          "exit_gate": ["the approved scope and commands are validated without a production mutation"]
+        },
+        {
+          "id": "authorize",
+          "pattern": "human_gate",
+          "depends_on": ["dry_run"],
+          "execution": "parent_gate",
+          "authority_for": "execute",
+          "produces": ["operation_authorization"],
+          "exit_gate": ["the named authority approves the exact target, scope, and action packet"]
+        },
+        {
+          "id": "execute",
+          "pattern": "chain",
+          "depends_on": ["authorize"],
+          "execution": "parent_action",
+          "action_source": "operation_plan",
+          "produces": ["operation_receipt"],
+          "exit_gate": ["the parent executes once through the single mutation lane and records per-item outcomes"]
+        },
+        {
+          "id": "poll",
+          "pattern": "bounded_agent_loop",
+          "depends_on": ["execute"],
+          "max_iterations": 20,
+          "execution": "route",
+          "route": {"activity": "poll"},
+          "produces": ["operation_status"],
+          "exit_gate": ["the operation reaches a terminal state or the polling bound is reached"]
+        },
+        {
+          "id": "diagnose_variance",
+          "pattern": "bounded_agent_loop",
+          "depends_on": ["poll"],
+          "condition": "operation_not_successful",
+          "condition_mode": "runtime",
+          "max_iterations": 2,
+          "execution": "route",
+          "route": {"activity": "diagnose", "scope": "cross_system", "ambiguity": "high", "risk_level": "high", "risk_scope": "judgment", "risk_tags": ["production", "release"]},
+          "produces": ["variance_diagnosis"],
+          "exit_gate": ["the variance is explained and the parent receives explicit stop, retry, or rollback options"]
+        },
+        {
+          "id": "verify",
+          "pattern": "fan_out",
+          "depends_on": ["poll"],
+          "execution": "route",
+          "route": {"activity": "exact_check"},
+          "produces": ["verification_record"],
+          "exit_gate": ["independent logs, dashboards, receipts, tests, or screenshots match the declared success criteria"]
+        },
+        {
+          "id": "close",
+          "pattern": "chain",
+          "depends_on": ["verify", "diagnose_variance"],
+          "execution": "route",
+          "route": {"activity": "summarize", "risk_level": "moderate", "risk_scope": "judgment"},
+          "produces": ["operations_report"],
+          "exit_gate": ["exact successes, failures, retries, residual risk, and evidence paths are reported"]
+        }
+      ]
+    }
+  }
+}
