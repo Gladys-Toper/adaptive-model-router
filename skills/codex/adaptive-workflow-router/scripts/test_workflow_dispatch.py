@@ -2154,6 +2154,13 @@ def test_tool_instructions_identify_local_execution_bridge() -> None:
     assert "MCP `js` tool" in instructions
     assert "local execution and file-edit bridge" in instructions
     assert "apply_patch" in instructions
+    assert "CommonJS require is unavailable" in instructions
+    assert "await import('node:child_process')" in instructions
+    assert "await import('node:fs')" in instructions
+    assert "spawnSync" in instructions
+    assert "execFile does not accept stdin input" in instructions
+    assert "execFileSync and spawnSync do" in instructions
+    assert "spawnSync('apply_patch', [], {input: patch, encoding: 'utf8'})" in instructions
     read_only = DISPATCH.local_tool_instructions("read-only", "default")
     assert "node_repl" in read_only
     assert "local inspection bridge" in read_only
@@ -2563,8 +2570,10 @@ def test_usage_errors_always_retain_an_abort_artifact() -> None:
             "--output-dir",
             str(requested_output),
         ]
+        stdout = io.StringIO()
         try:
-            assert DISPATCH.main() == 2
+            with contextlib.redirect_stdout(stdout):
+                assert DISPATCH.main() == 2
         finally:
             DISPATCH.RUNS = original_runs
             sys.argv = original_argv
@@ -2574,6 +2583,537 @@ def test_usage_errors_always_retain_an_abort_artifact() -> None:
         assert artifact["status"] == "ABORTED"
         assert artifact["category"] == "USAGE_ERROR"
         assert artifact["requested_output_dir"] == str(requested_output.resolve())
+        markers = [
+            line
+            for line in stdout.getvalue().splitlines()
+            if line.startswith("ADAPTIVE_CONTROL_RETURN ")
+        ]
+        assert len(markers) == 1
+        assert stdout.getvalue().splitlines()[-1] == markers[0]
+        directive = json.loads(markers[0].removeprefix("ADAPTIVE_CONTROL_RETURN "))
+        assert directive["terminal_category"] == "USAGE_ERROR"
+
+
+def test_adaptive_control_return_is_private_self_hashed_and_strict() -> None:
+    directive = DISPATCH.build_adaptive_control_return(
+        terminal_status="COMPLETED",
+        terminal_category=None,
+        phase_key="coding:inspect",
+    )
+    DISPATCH.validate_adaptive_control_return(directive)
+    assert directive["recommended_action"] == "t0_only"
+    assert directive["control_state"] == "OUTSIDE_ADAPTIVE_MODEL_EXECUTION"
+    tampered = dict(directive)
+    tampered["recommended_action"] = "start_adaptive_workflow"
+    try:
+        DISPATCH.validate_adaptive_control_return(tampered)
+    except DISPATCH.DispatchError:
+        pass
+    else:
+        raise AssertionError("control-return tampering was accepted")
+    with tempfile.TemporaryDirectory(prefix="workflow-control-return-") as temporary:
+        root = Path(temporary)
+        path = DISPATCH.persist_adaptive_control_return(root, directive)
+        assert json.loads(path.read_text(encoding="utf-8")) == directive
+        assert (path.stat().st_mode & 0o777) == 0o600
+
+
+def test_adaptive_control_return_recommendation_mapping() -> None:
+    assert DISPATCH._control_return_recommendation("COMPLETED", None) == "t0_only"
+    for category in (
+        "PARENT_OR_USER_AUTHORITY_REQUIRED",
+        "PARENT_GATE_REQUIRED",
+        "EXTERNAL_ACTION_REQUIRED",
+        "IRREVERSIBLE_ACTION_REQUIRED",
+        "USER_INPUT_REQUIRED",
+    ):
+        assert (
+            DISPATCH._control_return_recommendation("ABORTED", category)
+            == "ask_or_advise_user"
+        )
+    assert (
+        DISPATCH._control_return_recommendation("ABORTED", "BUDGET_STOP")
+        == "start_adaptive_workflow"
+    )
+
+
+def test_adaptive_control_return_finalizes_success_and_setup_failure_once() -> None:
+    with tempfile.TemporaryDirectory(prefix="workflow-control-finalize-") as temporary:
+        root = Path(temporary)
+        DISPATCH.write_json(
+            root / "execution-metadata.json",
+            {"schema_version": 1, "status": "COMPLETED"},
+        )
+        args = argparse.Namespace(
+            _run_root=root, phase_key="coding:inspect", resumable=False
+        )
+        first = DISPATCH.finalize_adaptive_control_return(args)
+        second = DISPATCH.finalize_adaptive_control_return(args)
+        assert first == second
+        sidecar = root / "control-return" / "adaptive-control-return.json"
+        assert json.loads(sidecar.read_text(encoding="utf-8")) == first
+        failure_root = root / "failure"
+        failure_args = argparse.Namespace(
+            _run_root=failure_root, phase_key=None, resumable=False, output_dir=None
+        )
+        failure_root.mkdir()
+        assert DISPATCH.write_setup_failure_artifact(
+            failure_args, DISPATCH.DispatchUsageError("bad input")
+        ) == failure_root
+        failure = json.loads(
+            (
+                failure_root
+                / "control-return"
+                / "adaptive-control-return.json"
+            ).read_text(encoding="utf-8")
+        )
+        assert failure["terminal_category"] == "USAGE_ERROR"
+        assert failure["recommended_action"] == "start_adaptive_workflow"
+
+
+def test_adaptive_control_return_marker_is_final_and_exactly_once() -> None:
+    directive = DISPATCH.build_adaptive_control_return(
+        terminal_status="ABORTED",
+        terminal_category="SETUP_FAILURE",
+        phase_key=None,
+    )
+    stream = io.StringIO()
+    with contextlib.redirect_stdout(stream):
+        print('{"terminal":"artifact"}')
+        DISPATCH.emit_adaptive_control_return_marker(directive)
+    lines = stream.getvalue().splitlines()
+    assert len([line for line in lines if line.startswith("ADAPTIVE_CONTROL_RETURN ")]) == 1
+    assert lines[-1] == (
+        "ADAPTIVE_CONTROL_RETURN " + DISPATCH.canonical_json(directive)
+    )
+
+
+def test_adaptive_control_return_abort_precedes_completed_metadata() -> None:
+    with tempfile.TemporaryDirectory(prefix="workflow-control-precedence-") as temporary:
+        root = Path(temporary)
+        DISPATCH.write_json(
+            root / "execution-metadata.json",
+            {"schema_version": 1, "status": "COMPLETED"},
+        )
+        time.sleep(0.001)
+        DISPATCH.write_json(
+            root / "aborted.json",
+            {"schema_version": 1, "status": "ABORTED", "category": "BUDGET_STOP"},
+        )
+        args = argparse.Namespace(
+            _run_root=root, phase_key="coding:inspect", resumable=False
+        )
+        directive = DISPATCH.finalize_adaptive_control_return(args)
+        assert directive is not None
+        DISPATCH.validate_adaptive_control_return(directive)
+        assert directive["terminal_status"] == "ABORTED"
+        assert directive["terminal_category"] == "BUDGET_STOP"
+        assert directive["recommended_action"] == "start_adaptive_workflow"
+
+
+def test_adaptive_control_return_rejects_budget_and_runtime_outcomes() -> None:
+    with tempfile.TemporaryDirectory(prefix="workflow-control-rejection-") as temporary:
+        root = Path(temporary)
+        for category in ("BUDGET_STOP", "MODEL_OR_RUNTIME_REJECTION"):
+            DISPATCH.write_json(
+                root / "aborted.json",
+                {"schema_version": 1, "status": "ABORTED", "category": category},
+            )
+            directive = DISPATCH.finalize_adaptive_control_return(
+                argparse.Namespace(_run_root=root, phase_key=None, resumable=False)
+            )
+            assert directive is not None
+            DISPATCH.validate_adaptive_control_return(directive)
+            assert directive["recommended_action"] == "start_adaptive_workflow"
+
+
+def test_parent_authority_control_return_propagates_category() -> None:
+    with tempfile.TemporaryDirectory(prefix="workflow-control-authority-") as temporary:
+        args = argparse.Namespace(
+            _run_root=Path(temporary), phase_key=None, resumable=False, output_dir=None
+        )
+        DISPATCH.write_setup_failure_artifact(
+            args,
+            DISPATCH.ParentAuthorityRequired(
+                "parent approval required", "PARENT_GATE_REQUIRED"
+            ),
+        )
+        directive = args._adaptive_control_return
+        DISPATCH.validate_adaptive_control_return(directive)
+        assert directive["terminal_category"] == "PARENT_GATE_REQUIRED"
+        assert directive["recommended_action"] == "ask_or_advise_user"
+
+
+def test_smoke_emits_one_final_propagated_control_return_marker() -> None:
+    directive = DISPATCH.build_adaptive_control_return(
+        terminal_status="ABORTED",
+        terminal_category="BUDGET_STOP",
+        phase_key=None,
+    )
+    original = DISPATCH.run_phase
+
+    def fake_run_phase(run_args: argparse.Namespace) -> int:
+        run_args._run_root = Path(tempfile.gettempdir())
+        run_args._adaptive_control_return = directive
+        return 2
+
+    DISPATCH.run_phase = fake_run_phase
+    args = argparse.Namespace(
+        tier="T1", token_cap=None, token_cap_contract=None, wall_time_seconds=1
+    )
+    stream = io.StringIO()
+    try:
+        with contextlib.redirect_stdout(stream):
+            assert DISPATCH.run_smoke(args) == 2
+    finally:
+        DISPATCH.run_phase = original
+    lines = stream.getvalue().splitlines()
+    assert lines == [
+        "ADAPTIVE_CONTROL_RETURN " + DISPATCH.canonical_json(directive)
+    ]
+    assert args._adaptive_control_return == directive
+
+
+def test_main_control_return_terminal_paths() -> None:
+    def marker_lines(output: str) -> list[str]:
+        return [
+            line
+            for line in output.splitlines()
+            if line.startswith("ADAPTIVE_CONTROL_RETURN ")
+        ]
+
+    def invoke(argv: list[str], **replacements: Any) -> tuple[int, str, str]:
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        original_argv = sys.argv
+        try:
+            sys.argv = argv
+            with patched_dispatch(
+                enforce_install_admission=lambda command: None, **replacements
+            ):
+                with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(
+                    stderr
+                ):
+                    result = DISPATCH.main()
+        finally:
+            sys.argv = original_argv
+        return result, stdout.getvalue(), stderr.getvalue()
+
+    fake_governance = SimpleNamespace(
+        LEASE_ROLES=DISPATCH.governance.LEASE_ROLES,
+        reserve_agent=lambda **kwargs: {"lease": {}},
+        complete_reservation=lambda *args, **kwargs: {"terminal": "released"},
+    )
+    with tempfile.TemporaryDirectory(prefix="workflow-main-control-return-") as temporary:
+        root = Path(temporary)
+        request = root / "request.json"
+        prompt = root / "prompt.txt"
+        request.write_text("{}", encoding="utf-8")
+        prompt.write_text("prompt", encoding="utf-8")
+        run_argv = [
+            "workflow_dispatch.py",
+            "run",
+            "--request",
+            str(request),
+            "--prompt-file",
+            str(prompt),
+            "--cwd",
+            str(root),
+        ]
+
+        completed_root = root / "completed"
+        completed_root.mkdir()
+
+        def completed_phase(namespace: argparse.Namespace) -> int:
+            namespace._run_root = completed_root
+            DISPATCH.write_json(
+                completed_root / "execution-metadata.json",
+                {"schema_version": 1, "status": "COMPLETED"},
+            )
+            DISPATCH.finalize_adaptive_control_return(namespace)
+            print(json.dumps({"status": "COMPLETED"}, sort_keys=True))
+            return 0
+
+        result, output, error_output = invoke(
+            run_argv, governance=fake_governance, run_phase=completed_phase
+        )
+        assert result == 0, (result, output, error_output)
+        assert '"status": "COMPLETED"' in output
+        assert len(marker_lines(output)) == 1
+        assert output.splitlines()[-1] == marker_lines(output)[0]
+        completed = json.loads(
+            (
+                completed_root / "control-return" / "adaptive-control-return.json"
+            ).read_text(encoding="utf-8")
+        )
+        assert completed["recommended_action"] == "t0_only"
+
+        usage_root = root / "usage"
+        usage_root.mkdir()
+
+        def usage_phase(namespace: argparse.Namespace) -> int:
+            namespace._run_root = usage_root
+            raise DISPATCH.DispatchUsageError("retained usage failure")
+
+        result, output, _ = invoke(
+            ["workflow_dispatch.py", "smoke", "--tier", "T1", "--wall-time-seconds", "1"],
+            run_phase=usage_phase,
+        )
+        assert result == 2
+        assert len(marker_lines(output)) == 1
+        assert output.splitlines()[-1] == marker_lines(output)[0]
+        usage = json.loads(
+            (usage_root / "control-return" / "adaptive-control-return.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        assert usage["terminal_category"] == "USAGE_ERROR"
+        assert usage["recommended_action"] == "start_adaptive_workflow"
+
+        setup_root = root / "setup"
+        setup_root.mkdir()
+
+        def setup_phase(namespace: argparse.Namespace) -> int:
+            namespace._run_root = setup_root
+            raise DISPATCH.DispatchError("setup failed")
+
+        result, output, _ = invoke(
+            run_argv, governance=fake_governance, run_phase=setup_phase
+        )
+        assert result == 2
+        assert len(marker_lines(output)) == 1
+        assert output.splitlines()[-1] == marker_lines(output)[0]
+        setup_abort = json.loads(
+            (setup_root / "aborted.json").read_text(encoding="utf-8")
+        )
+        assert setup_abort["category"] == "SETUP_FAILURE"
+        setup = json.loads(
+            (
+                setup_root
+                / "control-return"
+                / "adaptive-control-return.json"
+            ).read_text(encoding="utf-8")
+        )
+        assert setup["terminal_category"] == "SETUP_FAILURE"
+        assert setup["recommended_action"] == "start_adaptive_workflow"
+
+        authority_root = root / "authority"
+        authority_root.mkdir()
+
+        def authority_phase(namespace: argparse.Namespace) -> int:
+            namespace._run_root = authority_root
+            raise DISPATCH.ParentAuthorityRequired(
+                "parent approval required", "PARENT_GATE_REQUIRED"
+            )
+
+        result, output, _ = invoke(
+            run_argv, governance=fake_governance, run_phase=authority_phase
+        )
+        assert result == 2
+        assert len(marker_lines(output)) == 1
+        authority = json.loads(
+            (
+                authority_root / "control-return" / "adaptive-control-return.json"
+            ).read_text(encoding="utf-8")
+        )
+        assert authority["terminal_category"] == "PARENT_GATE_REQUIRED"
+        assert authority["recommended_action"] == "ask_or_advise_user"
+
+        for category in ("BUDGET_STOP", "MODEL_OR_RUNTIME_REJECTION"):
+            rejected_root = root / category
+            rejected_root.mkdir()
+
+            def rejected_phase(
+                namespace: argparse.Namespace, category: str = category
+            ) -> int:
+                namespace._run_root = rejected_root
+                DISPATCH.write_json(
+                    rejected_root / "aborted.json",
+                    {
+                        "schema_version": 1,
+                        "status": "ABORTED",
+                        "category": category,
+                    },
+                )
+                DISPATCH.finalize_adaptive_control_return(namespace)
+                print(json.dumps({"status": "ABORTED", "category": category}))
+                return 2
+
+            result, output, _ = invoke(
+                run_argv, governance=fake_governance, run_phase=rejected_phase
+            )
+            assert result == 2
+            assert len(marker_lines(output)) == 1
+            assert output.index('"status": "ABORTED"') < output.index(
+                marker_lines(output)[0]
+            )
+            rejected = json.loads(
+                (
+                    rejected_root
+                    / "control-return"
+                    / "adaptive-control-return.json"
+                ).read_text(encoding="utf-8")
+            )
+            assert rejected["recommended_action"] == "start_adaptive_workflow"
+
+        resume_root = root / "resume"
+        checkpoint = resume_root / "checkpoint.json"
+        resume_root.mkdir()
+        checkpoint.write_text("{}", encoding="utf-8")
+
+        def resumed(namespace: argparse.Namespace) -> int:
+            namespace._run_root = resume_root
+            namespace.phase_key = "coding:inspect"
+            namespace.resumable = True
+            DISPATCH.write_json(
+                resume_root / "execution-metadata.json",
+                {"schema_version": 1, "status": "COMPLETED"},
+            )
+            DISPATCH.finalize_adaptive_control_return(namespace)
+            return 0
+
+        result, output, _ = invoke(
+            ["workflow_dispatch.py", "resume", "--checkpoint", str(checkpoint)],
+            resume_phase=resumed,
+        )
+        assert result == 0
+        assert len(marker_lines(output)) == 1
+        assert output.splitlines()[-1] == marker_lines(output)[0]
+        assert (
+            json.loads(
+                (
+                    resume_root
+                    / "control-return"
+                    / "adaptive-control-return.json"
+                ).read_text(encoding="utf-8")
+            )["terminal_status"]
+            == "COMPLETED"
+        )
+
+
+def test_resume_exception_finalizes_canonical_abort_and_control_return() -> None:
+    with tempfile.TemporaryDirectory(prefix="workflow-control-resume-") as temporary:
+        root = Path(temporary)
+        checkpoint_path = root / "checkpoint.json"
+        checkpoint_path.write_text("{}", encoding="utf-8")
+        checkpoint = {
+            "checkpoint_sha256": "a" * 64,
+            "binding": {
+                "resume_contract": {
+                    "attempt_wall_time_seconds": 1,
+                    "max_continuations": 1,
+                    "cumulative_wall_time_seconds": 2,
+                    "checkpoint_window_seconds": 1,
+                    "shutdown_window_seconds": 1,
+                    "checkpoint_ttl_seconds": 1,
+                    "work_manifest": {"path": str(root / "work.json")},
+                },
+                "plan_path": str(root / "plan.json"),
+                "phase_key": "coding:inspect",
+                "dispatch_packet_path": str(root / "packet.json"),
+                "prompt_path": str(root / "prompt.txt"),
+                "context_files": [],
+                "cwd": str(root),
+                "permissions": {
+                    "sandbox": "read-only",
+                    "network_access": False,
+                    "mutation_authorized": False,
+                },
+            },
+        }
+        original_argv = sys.argv
+        stdout = io.StringIO()
+        try:
+            sys.argv = [
+                "workflow_dispatch.py",
+                "resume",
+                "--checkpoint",
+                str(checkpoint_path),
+            ]
+            with patched_dispatch(
+                enforce_install_admission=lambda command: None,
+                load_resume_checkpoint=lambda path: (checkpoint, {}),
+                run_phase=lambda namespace: (_ for _ in ()).throw(
+                    DISPATCH.DispatchError("resume failed")
+                ),
+            ):
+                with contextlib.redirect_stdout(stdout):
+                    assert DISPATCH.main() == 2
+        finally:
+            sys.argv = original_argv
+        assert list(root.glob("resume-setup-failure.*.json"))
+        aborted = json.loads((root / "aborted.json").read_text(encoding="utf-8"))
+        assert aborted["category"] == "RESUME_SETUP_FAILURE"
+        markers = [
+            line
+            for line in stdout.getvalue().splitlines()
+            if line.startswith("ADAPTIVE_CONTROL_RETURN ")
+        ]
+        assert len(markers) == 1
+        assert stdout.getvalue().splitlines()[-1] == markers[0]
+        directive = json.loads(markers[0].removeprefix("ADAPTIVE_CONTROL_RETURN "))
+        DISPATCH.validate_adaptive_control_return(directive)
+        assert directive["terminal_category"] == "RESUME_SETUP_FAILURE"
+
+        authority_root = root / "authority"
+        authority_root.mkdir()
+        authority_checkpoint_path = authority_root / "checkpoint.json"
+        authority_checkpoint_path.write_text("{}", encoding="utf-8")
+        authority_stdout = io.StringIO()
+        try:
+            sys.argv = [
+                "workflow_dispatch.py",
+                "resume",
+                "--checkpoint",
+                str(authority_checkpoint_path),
+            ]
+            with patched_dispatch(
+                enforce_install_admission=lambda command: None,
+                load_resume_checkpoint=lambda path: (checkpoint, {}),
+                run_phase=lambda namespace: (_ for _ in ()).throw(
+                    DISPATCH.ParentAuthorityRequired(
+                        "parent approval required", "PARENT_GATE_REQUIRED"
+                    )
+                ),
+            ):
+                with contextlib.redirect_stdout(authority_stdout):
+                    assert DISPATCH.main() == 2
+        finally:
+            sys.argv = original_argv
+        authority_aborted = json.loads(
+            (authority_root / "aborted.json").read_text(encoding="utf-8")
+        )
+        assert authority_aborted["category"] == "PARENT_GATE_REQUIRED"
+        authority_markers = [
+            line
+            for line in authority_stdout.getvalue().splitlines()
+            if line.startswith("ADAPTIVE_CONTROL_RETURN ")
+        ]
+        assert len(authority_markers) == 1
+        assert authority_stdout.getvalue().splitlines()[-1] == authority_markers[0]
+        authority_directive = json.loads(
+            authority_markers[0].removeprefix("ADAPTIVE_CONTROL_RETURN ")
+        )
+        DISPATCH.validate_adaptive_control_return(authority_directive)
+        assert authority_directive["terminal_category"] == "PARENT_GATE_REQUIRED"
+        assert authority_directive["recommended_action"] == "ask_or_advise_user"
+
+
+def test_aborted_json_output_precedes_final_control_return_marker() -> None:
+    source = SCRIPT.read_text(encoding="utf-8")
+    assert source.count("print(json.dumps(aborted, indent=2, sort_keys=True))") == 3
+    directive = DISPATCH.build_adaptive_control_return(
+        terminal_status="ABORTED",
+        terminal_category="BUDGET_STOP",
+        phase_key=None,
+    )
+    stream = io.StringIO()
+    with contextlib.redirect_stdout(stream):
+        print(json.dumps({"status": "ABORTED"}, indent=2, sort_keys=True))
+        DISPATCH.emit_adaptive_control_return_marker(directive)
+    assert stream.getvalue().splitlines()[-1].startswith(
+        "ADAPTIVE_CONTROL_RETURN "
+    )
 
 
 def test_execution_registry_append_is_hash_chained_and_tamper_evident() -> None:
@@ -3828,6 +4368,17 @@ if __name__ == "__main__":
         test_no_tools_contract_rejects_tool_items,
         test_historical_mutating_transcripts_require_observed_tool_use,
         test_tool_instructions_identify_local_execution_bridge,
+        test_adaptive_control_return_is_private_self_hashed_and_strict,
+        test_adaptive_control_return_recommendation_mapping,
+        test_adaptive_control_return_finalizes_success_and_setup_failure_once,
+        test_adaptive_control_return_marker_is_final_and_exactly_once,
+        test_adaptive_control_return_abort_precedes_completed_metadata,
+        test_adaptive_control_return_rejects_budget_and_runtime_outcomes,
+        test_parent_authority_control_return_propagates_category,
+        test_smoke_emits_one_final_propagated_control_return_marker,
+        test_main_control_return_terminal_paths,
+        test_resume_exception_finalizes_canonical_abort_and_control_return,
+        test_aborted_json_output_precedes_final_control_return_marker,
         test_local_tool_readiness_blocks_turn_start_until_ready,
         test_no_tools_contract_rejects_unknown_and_extended_item_types,
         test_no_tools_live_interrupt_ignores_foreign_thread_events,

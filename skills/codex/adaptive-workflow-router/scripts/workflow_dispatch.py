@@ -94,6 +94,8 @@ BUDGET_INCREASE_REVIEW_PROPOSAL_NAME = (
     "adaptive-workflow.execution-budget-increase-review"
 )
 CHECKPOINT_PREFIX = "ADAPTIVE_WORKFLOW_CHECKPOINT\n"
+ADAPTIVE_CONTROL_RETURN_NAME = "adaptive-workflow.control-return"
+ADAPTIVE_CONTROL_RETURN_MARKER = "ADAPTIVE_CONTROL_RETURN"
 RESUME_AUTHORITY_NAME = "adaptive-workflow.resumption-authority"
 RESUME_WORK_MANIFEST_NAME = "adaptive-workflow.resume-work-manifest"
 RESUME_COMPLETION_MODES = {
@@ -143,6 +145,21 @@ class DispatchError(RuntimeError):
 
 class DispatchUsageError(DispatchError):
     """A command-line contract error that must retain an abort artifact."""
+
+
+class DispatchArgumentParser(argparse.ArgumentParser):
+    """Route parser contract failures through dispatcher abort retention."""
+
+    def error(self, message: str) -> None:
+        raise DispatchUsageError(message)
+
+
+class ParentAuthorityRequired(DispatchError):
+    """A refusal which must be returned to the parent or user for authority."""
+
+    def __init__(self, message: str, category: str):
+        super().__init__(message)
+        self.category = category
 
 
 class AppServerDeadline(DispatchError):
@@ -1056,6 +1073,154 @@ def _atomic_private_json(path: Path, value: dict[str, Any]) -> None:
     )
 
 
+def _control_return_recommendation(status: str, category: str | None) -> str:
+    if status == "COMPLETED":
+        return "t0_only"
+    if category in {
+        "PARENT_OR_USER_AUTHORITY_REQUIRED",
+        "PARENT_GATE_REQUIRED",
+        "EXTERNAL_ACTION_REQUIRED",
+        "IRREVERSIBLE_ACTION_REQUIRED",
+        "USER_INPUT_REQUIRED",
+    }:
+        return "ask_or_advise_user"
+    return "start_adaptive_workflow"
+
+
+def build_adaptive_control_return(
+    *,
+    terminal_status: str,
+    terminal_category: str | None,
+    phase_key: str | None,
+    resumable: bool = False,
+    resume_checkpoint_present: bool = False,
+) -> dict[str, Any]:
+    """Build the private operational handoff; it is deliberately not evidence."""
+    directive = {
+        "schema_version": 1,
+        "contract_name": ADAPTIVE_CONTROL_RETURN_NAME,
+        "contract_version": 1,
+        "terminal_status": terminal_status,
+        "terminal_category": terminal_category,
+        "recommended_action": _control_return_recommendation(
+            terminal_status, terminal_category
+        ),
+        "control_state": "OUTSIDE_ADAPTIVE_MODEL_EXECUTION",
+        "allowed_parent_operations": [
+            "t0_only",
+            "ask_or_advise_user",
+            "start_adaptive_workflow",
+        ],
+        "prohibited_parent_operations": [
+            "continue_cognitive_work_in_inherited_parent_model"
+        ],
+        "workflow_state": {
+            "plan_bound": phase_key is not None,
+            "phase_key": phase_key,
+            "resumable": resumable,
+            "resume_checkpoint_present": resume_checkpoint_present,
+        },
+    }
+    directive["directive_sha256"] = content_hash(directive)
+    return directive
+
+
+def validate_adaptive_control_return(directive: dict[str, Any]) -> None:
+    if not isinstance(directive, dict):
+        raise DispatchError("adaptive control-return directive is invalid")
+    supplied = directive.get("directive_sha256")
+    bare = dict(directive)
+    bare.pop("directive_sha256", None)
+    if not isinstance(supplied, str) or content_hash(bare) != supplied:
+        raise DispatchError("adaptive control-return checksum mismatch")
+    status = directive.get("terminal_status")
+    category = directive.get("terminal_category")
+    state = directive.get("workflow_state")
+    if (
+        not isinstance(status, str)
+        or (category is not None and not isinstance(category, str))
+        or not isinstance(state, dict)
+        or (
+            state.get("phase_key") is not None
+            and not isinstance(state.get("phase_key"), str)
+        )
+        or type(state.get("resumable")) is not bool
+        or type(state.get("resume_checkpoint_present")) is not bool
+    ):
+        raise DispatchError("adaptive control-return workflow state is invalid")
+    expected = build_adaptive_control_return(
+        terminal_status=status,
+        terminal_category=category,
+        phase_key=state.get("phase_key"),
+        resumable=state["resumable"],
+        resume_checkpoint_present=state["resume_checkpoint_present"],
+    )
+    if directive != expected:
+        raise DispatchError("adaptive control-return directive is not deterministic")
+
+
+def persist_adaptive_control_return(root: Path, directive: dict[str, Any]) -> Path:
+    validate_adaptive_control_return(directive)
+    path = root / "control-return" / "adaptive-control-return.json"
+    _atomic_private_json(path, directive)
+    return path
+
+
+def _terminal_facts(root: Path) -> tuple[str, str | None] | None:
+    terminal_records: list[tuple[int, int, str, str | None]] = []
+    for name in ("execution-metadata.json", "aborted.json"):
+        path = root / name
+        if not path.is_file() or path.is_symlink():
+            continue
+        try:
+            record = read_json(path.resolve(strict=True), name)
+        except DispatchError:
+            continue
+        status = record.get("status")
+        if isinstance(status, str):
+            category = record.get("category")
+            terminal_records.append(
+                (
+                    path.stat().st_mtime_ns,
+                    1 if name == "aborted.json" else 0,
+                    status,
+                    category if isinstance(category, str) else None,
+                )
+            )
+    if not terminal_records:
+        return None
+    _, _, status, category = max(terminal_records)
+    return status, category
+
+
+def finalize_adaptive_control_return(
+    args: argparse.Namespace,
+) -> dict[str, Any] | None:
+    """Persist one non-receipt handoff from terminal records."""
+    root = getattr(args, "_run_root", None)
+    if not isinstance(root, Path):
+        return None
+    facts = _terminal_facts(root)
+    if facts is None:
+        return None
+    status, category = facts
+    directive = build_adaptive_control_return(
+        terminal_status=status,
+        terminal_category=category,
+        phase_key=getattr(args, "phase_key", None),
+        resumable=bool(getattr(args, "resumable", False)),
+        resume_checkpoint_present=(root / "checkpoint.json").is_file(),
+    )
+    persist_adaptive_control_return(root, directive)
+    args._adaptive_control_return = directive
+    return directive
+
+
+def emit_adaptive_control_return_marker(directive: dict[str, Any]) -> None:
+    validate_adaptive_control_return(directive)
+    print(f"{ADAPTIVE_CONTROL_RETURN_MARKER} {canonical_json(directive)}")
+
+
 def _decode_receipt_registry(value: bytes) -> list[dict[str, Any]]:
     events: list[dict[str, Any]] = []
     previous = "0" * 64
@@ -1183,7 +1348,10 @@ def write_setup_failure_artifact(args: argparse.Namespace, error: Exception) -> 
     timestamp = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     fallback_root = RUNS / f"{timestamp}-setup-failure-{uuid.uuid4().hex[:8]}"
     root: Path | None = None
-    for candidate in (requested_root, fallback_root):
+    existing_root = getattr(args, "_run_root", None)
+    if isinstance(existing_root, Path) and existing_root.is_dir():
+        root = existing_root
+    for candidate in (() if root is not None else (requested_root, fallback_root)):
         if candidate is None:
             continue
         try:
@@ -1198,16 +1366,21 @@ def write_setup_failure_artifact(args: argparse.Namespace, error: Exception) -> 
         except OSError:
             return None
     try:
+        category = (
+            getattr(error, "category", None)
+            if isinstance(error, ParentAuthorityRequired)
+            else (
+                "USAGE_ERROR"
+                if isinstance(error, DispatchUsageError)
+                else "SETUP_FAILURE"
+            )
+        )
         write_json(
             root / "aborted.json",
             {
                 "schema_version": 1,
                 "status": "ABORTED",
-                "category": (
-                    "USAGE_ERROR"
-                    if isinstance(error, DispatchUsageError)
-                    else "SETUP_FAILURE"
-                ),
+                "category": category,
                 "reason": str(error),
                 "error_type": type(error).__name__,
                 "phase_key": getattr(args, "phase_key", None),
@@ -1216,9 +1389,42 @@ def write_setup_failure_artifact(args: argparse.Namespace, error: Exception) -> 
                 ),
             },
         )
+        args._run_root = root
+        finalize_adaptive_control_return(args)
     except OSError:
         return None
     return root
+
+
+def retained_abort_artifact(args: argparse.Namespace) -> Path | None:
+    """Return a resume-finalized abort only when its retained binding is intact."""
+    retained = getattr(args, "_retained_abort", None)
+    if not isinstance(retained, dict):
+        return None
+    artifact = retained.get("artifact_path")
+    directive = retained.get("directive")
+    root = getattr(args, "_run_root", None)
+    if (
+        not isinstance(artifact, Path)
+        or not isinstance(root, Path)
+        or artifact != root / "aborted.json"
+        or not artifact.is_file()
+        or retained.get("artifact_sha256") != sha256_bytes(artifact.read_bytes())
+        or directive != getattr(args, "_adaptive_control_return", None)
+    ):
+        return None
+    try:
+        aborted = read_json(artifact.resolve(strict=True), "aborted artifact")
+        validate_adaptive_control_return(directive)
+    except (DispatchError, OSError):
+        return None
+    if (
+        aborted.get("status") != "ABORTED"
+        or directive.get("terminal_status") != "ABORTED"
+        or aborted.get("category") != directive.get("terminal_category")
+    ):
+        return None
+    return artifact
 
 
 def failure_namespace_from_argv(argv: list[str]) -> argparse.Namespace:
@@ -2332,15 +2538,19 @@ def local_tool_instructions(sandbox: str, tool_mode: str) -> str:
             "the node_repl MCP `js` tool is the local inspection bridge, not an "
             "external connector. Use it only for reads inside the bound filesystem, "
             "and do not claim local tools are unavailable without first attempting "
-            "node_repl."
+            "node_repl. node_repl is ESM: CommonJS require is unavailable; use "
+            "`await import('node:fs')` and `await import('node:child_process')`."
         )
     if sandbox != "workspace-write":
         return ""
     return (
         " This is an authorized local workspace-write route. On this App Server "
         "the node_repl MCP `js` tool is the local execution and file-edit bridge, "
-        "not an external connector. Use it with local filesystem APIs or execFile "
-        "and the installed apply_patch command, remain inside the bound cwd, and "
+        "not an external connector. node_repl is ESM: CommonJS require is unavailable; "
+        "use `await import('node:fs')` and `await import('node:child_process')`. "
+        "Use `spawnSync('apply_patch', [], {input: patch, encoding: 'utf8'})` for "
+        "the installed apply_patch command: execFile does not accept stdin input, "
+        "while execFileSync and spawnSync do; remain inside the bound cwd, and "
         "verify the resulting files. Do not claim local tools are unavailable "
         "without first attempting node_repl."
     )
@@ -2400,11 +2610,20 @@ def validate_authority(
             "the no-tools contract requires read-only sandboxing with network disabled"
         )
     if request.get("external_action") and request.get("activity") != "prepare_external":
-        raise DispatchError("external actions remain parent-only and cannot be dispatched")
+        raise ParentAuthorityRequired(
+            "external actions remain parent-only and cannot be dispatched",
+            "EXTERNAL_ACTION_REQUIRED",
+        )
     if resolution.get("parent_gate_required"):
-        raise DispatchError("parent-gated phases cannot be dispatched before parent action")
+        raise ParentAuthorityRequired(
+            "parent-gated phases cannot be dispatched before parent action",
+            "PARENT_GATE_REQUIRED",
+        )
     if mutation == "irreversible":
-        raise DispatchError("irreversible mutation remains parent-only")
+        raise ParentAuthorityRequired(
+            "irreversible mutation remains parent-only",
+            "IRREVERSIBLE_ACTION_REQUIRED",
+        )
     if args.sandbox == "read-only" and mutation != "none":
         raise DispatchError("a mutating route requires workspace-write dispatch")
     if args.sandbox != "read-only":
@@ -4945,7 +5164,7 @@ def _run_resumable_phase(
             return abort("CHECKPOINT_COMMIT_FAILURE", [str(error)])
 
 
-def run_phase(args: argparse.Namespace) -> int:
+def _run_phase_impl(args: argparse.Namespace) -> int:
     request, plan_binding = load_route(args)
     resolution = resolve_phase(request)
     validate_resolution(resolution)
@@ -5298,6 +5517,7 @@ def run_phase(args: argparse.Namespace) -> int:
                 f"{timestamp}-{safe_slug(request['phase_id'])}",
                 mode=mode,
             )
+        args._run_root = root
         if resume_contract is not None:
             os.chmod(root, 0o700)
     copied_prompt = root / "prompt.txt"
@@ -5868,6 +6088,14 @@ def run_phase(args: argparse.Namespace) -> int:
     return 0 if not issues else 2
 
 
+def run_phase(args: argparse.Namespace) -> int:
+    """Run one routed phase and finalize its non-evidence control handoff."""
+    try:
+        return _run_phase_impl(args)
+    finally:
+        finalize_adaptive_control_return(args)
+
+
 def check_health() -> int:
     issues: list[str] = []
     details: dict[str, Any] = {"model_invocations": 0}
@@ -6294,7 +6522,17 @@ def run_smoke(args: argparse.Namespace) -> int:
             output_dir=None,
             expect_exact_output="ROUTE_OK",
         )
-        return run_phase(run_args)
+        try:
+            result = run_phase(run_args)
+        finally:
+            args._run_root = getattr(run_args, "_run_root", None)
+            args._adaptive_control_return = getattr(
+                run_args, "_adaptive_control_return", None
+            )
+        if args._adaptive_control_return is not None:
+            emit_adaptive_control_return_marker(args._adaptive_control_return)
+            args._adaptive_control_return_emitted = True
+        return result
 
 
 def registry_receipt(receipt_id: str) -> dict[str, Any]:
@@ -6447,6 +6685,7 @@ def resume_phase(args: argparse.Namespace) -> int:
     if not isinstance(resume_contract, dict):
         raise DispatchError("resume checkpoint omitted its authority contract")
     root = checkpoint_path.parent.resolve(strict=True)
+    args._run_root = root
     if (root / "execution-receipt.json").exists():
         raise DispatchError("resume run already has a final execution receipt")
     namespace = argparse.Namespace(
@@ -6484,12 +6723,23 @@ def resume_phase(args: argparse.Namespace) -> int:
         resume_checkpoint=checkpoint_path,
     )
     try:
-        return run_phase(namespace)
+        result = run_phase(namespace)
+        args.phase_key = namespace.phase_key
+        args.resumable = True
+        args._adaptive_control_return = getattr(
+            namespace, "_adaptive_control_return", None
+        )
+        return result
     except Exception as error:
+        category = (
+            error.category
+            if isinstance(error, ParentAuthorityRequired)
+            else "RESUME_SETUP_FAILURE"
+        )
         failure = {
             "schema_version": 1,
             "status": "ABORTED",
-            "category": "RESUME_SETUP_FAILURE",
+            "category": category,
             "reason": str(error),
             "error_type": type(error).__name__,
             "checkpoint_path": str(checkpoint_path),
@@ -6504,6 +6754,16 @@ def resume_phase(args: argparse.Namespace) -> int:
             ),
             failure,
         )
+        write_json(root / "aborted.json", failure)
+        args.phase_key = namespace.phase_key
+        args.resumable = True
+        finalize_adaptive_control_return(args)
+        artifact = root / "aborted.json"
+        args._retained_abort = {
+            "artifact_path": artifact,
+            "artifact_sha256": sha256_bytes(artifact.read_bytes()),
+            "directive": args._adaptive_control_return,
+        }
         raise
 
 
@@ -6794,7 +7054,13 @@ def main() -> int:
                 parser.error("smoke caps must be positive")
             if bool(args.token_cap is not None) != bool(args.token_cap_contract):
                 parser.error("--token-cap and --token-cap-contract must be supplied together")
-            return run_smoke(args)
+            result = run_smoke(args)
+            directive = getattr(args, "_adaptive_control_return", None)
+            if directive is not None and not getattr(
+                args, "_adaptive_control_return_emitted", False
+            ):
+                emit_adaptive_control_return_marker(directive)
+            return result
         if args.command == "register-quality":
             if args.grader_timeout_seconds < 1:
                 parser.error("--grader-timeout-seconds must be positive")
@@ -6808,7 +7074,11 @@ def main() -> int:
         if args.command == "close-tree":
             return close_parallel_tree(args)
         if args.command == "resume":
-            return resume_phase(args)
+            result = resume_phase(args)
+            directive = getattr(args, "_adaptive_control_return", None)
+            if directive is not None:
+                emit_adaptive_control_return_marker(directive)
+            return result
         if bool(args.plan) != bool(args.phase_key):
             parser.error("--plan and --phase-key must be supplied together")
         if bool(args.plan) != bool(args.dispatch_packet):
@@ -6913,12 +7183,22 @@ def main() -> int:
         # receipt makes capacity release observable even when the worker output
         # is truncated by a calling harness.
         print(json.dumps(terminal, sort_keys=True))
+        directive = getattr(args, "_adaptive_control_return", None)
+        if directive is not None:
+            emit_adaptive_control_return_marker(directive)
         return result
     except Exception as error:
         failure_args = args or failure_namespace_from_argv(sys.argv[1:])
-        artifact = write_setup_failure_artifact(failure_args, error)
-        if artifact:
-            artifact_path = artifact / "aborted.json"
+        retained_artifact = retained_abort_artifact(failure_args)
+        if retained_artifact is not None:
+            artifact_path = retained_artifact
+        else:
+            failure_args._adaptive_control_return = None
+            artifact_root = write_setup_failure_artifact(failure_args, error)
+            artifact_path = (
+                artifact_root / "aborted.json" if artifact_root is not None else None
+            )
+        if artifact_path is not None:
             suffix = (
                 f"; artifact: {artifact_path}; "
                 f"sha256: {sha256_bytes(artifact_path.read_bytes())}"
@@ -6926,6 +7206,9 @@ def main() -> int:
         else:
             suffix = "; artifact retention failed"
         print(f"workflow_dispatch: {error}{suffix}", file=sys.stderr)
+        directive = getattr(failure_args, "_adaptive_control_return", None)
+        if directive is not None:
+            emit_adaptive_control_return_marker(directive)
         return 2
 
 

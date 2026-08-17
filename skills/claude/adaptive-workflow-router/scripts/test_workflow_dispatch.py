@@ -44,6 +44,7 @@ class FakeClaudeCLI(DISPATCH.ClaudeCLI):
     calls: list[dict[str, Any]] = []
     result_overrides: dict[str, Any] = {}
     returncode = 0
+    timeout_partial: str | None = None  # if set, simulate a wall-time timeout
 
     def run(
         self, command: list[str], *, prompt: str, cwd: Path, timeout: int
@@ -56,6 +57,8 @@ class FakeClaudeCLI(DISPATCH.ClaudeCLI):
                 "timeout": timeout,
             }
         )
+        if type(self).timeout_partial is not None:
+            return DISPATCH.DISPATCH_TIMEOUT_RETURNCODE, type(self).timeout_partial, ""
         events = [
             {"type": "system", "subtype": "init", "session_id": "sess-abc"},
             {
@@ -137,6 +140,30 @@ def build_fixture(root: Path) -> dict[str, Any]:
     )
     packet_path = root / "packet.json"
     packet_path.write_text(json.dumps(packet), encoding="utf-8")
+    # A second packet over the same plan and prompt, bound to the mutating lane
+    # that has to run its own verification inside `cwd`.
+    workspace_packet = json.loads(
+        run_planner(
+            "bind",
+            "--plan",
+            str(plan_path),
+            "--phase-key",
+            phase["phase_key"],
+            "--prompt-file",
+            str(prompt_path),
+            "--cwd",
+            str(root),
+            "--sandbox",
+            "workspace-write",
+            "--tool-mode",
+            "default",
+            "--mutation-authorized",
+            "--wall-time-seconds",
+            "60",
+        ).stdout
+    )
+    workspace_packet_path = root / "workspace-packet.json"
+    workspace_packet_path.write_text(json.dumps(workspace_packet), encoding="utf-8")
     return {
         "plan": plan,
         "plan_path": plan_path,
@@ -144,6 +171,8 @@ def build_fixture(root: Path) -> dict[str, Any]:
         "prompt_path": prompt_path,
         "packet": packet,
         "packet_path": packet_path,
+        "workspace_packet": workspace_packet,
+        "workspace_packet_path": workspace_packet_path,
         "root": root,
     }
 
@@ -168,6 +197,29 @@ def reset_fake() -> None:
     FakeClaudeCLI.calls = []
     FakeClaudeCLI.result_overrides = {}
     FakeClaudeCLI.returncode = 0
+    FakeClaudeCLI.timeout_partial = None
+    _isolate_state()
+
+
+def _isolate_state() -> None:
+    """Redirect every state-writing path into a fresh per-test sandbox.
+
+    State-writing tests must NEVER touch the live ~/.claude registry: on a
+    real machine the registry already holds receipts, so genesis-hash
+    assertions fail (the installed-verify failure this fixes) — and worse,
+    the old cleanup pattern unlinked the operator's real receipt chain.
+    Read-only tests (e.g. the router admission check) intentionally do not
+    call reset_fake() and keep reading the live home, which is exactly what
+    installed verification wants to certify.
+    """
+    sandbox = Path(tempfile.mkdtemp(prefix="claude-dispatch-state-"))
+    DISPATCH.STATE_HOME = sandbox
+    DISPATCH.RUNS = sandbox / "runs"
+    DISPATCH.EXECUTION_REGISTRY = sandbox / "execution-registry.jsonl"
+    DISPATCH.EXECUTION_REGISTRY_LOCK = sandbox / "execution-registry.jsonl.lock"
+    DISPATCH.EXECUTION_REGISTRY_JOURNAL = (
+        sandbox / "execution-registry.jsonl-journal.json"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -191,6 +243,7 @@ def test_flag_assembly_is_exact() -> None:
         "medium",
         "--output-format",
         "stream-json",
+        "--verbose",
         "--max-budget-usd",
         "1.0000",
         "--permission-mode",
@@ -206,6 +259,25 @@ def test_flag_assembly_is_exact() -> None:
         disallowed_tools=(),
     )
     assert "--disallowedTools" not in bare
+    assert "--allowedTools" not in bare
+
+    # Both tool-list flags are variadic in the real CLI, so they must remain the
+    # trailing flags (the prompt travels on stdin) and each is one comma-joined
+    # value that preserves patterns containing spaces.
+    verifying = client.build_command(
+        model="sonnet",
+        effort="high",
+        max_budget_usd=2.0,
+        permission_mode="acceptEdits",
+        disallowed_tools=("WebFetch", "WebSearch"),
+        allowed_tools=("Bash(npm test:*)", "Bash(pytest:*)"),
+    )
+    assert verifying[-4:] == [
+        "--allowedTools",
+        "Bash(npm test:*),Bash(pytest:*)",
+        "--disallowedTools",
+        "WebFetch,WebSearch",
+    ]
 
 
 def test_max_effort_is_refused_not_downgraded() -> None:
@@ -295,6 +367,114 @@ def test_run_retains_stream_extracts_metadata_and_chains_receipts(
         assert "hash" in str(error)
     else:  # pragma: no cover
         raise AssertionError("tampered registry was accepted")
+
+
+def test_workspace_write_lane_can_verify_without_host_execution(
+    fixture: dict[str, Any],
+) -> None:
+    """Harness issue #24 item 2: a mutating lane must run its own tests.
+
+    ``acceptEdits`` alone auto-approves edits but refuses every Bash command
+    ("This command requires approval"), which print mode can never answer, so
+    the worker implemented and the coordinator verified.  The lane now carries a
+    bounded ``--allowedTools`` verification vocabulary; the read-only lane is
+    untouched and still receives no grant at all.
+    """
+    reset_fake()
+    result = DISPATCH.command_run(
+        run_args(
+            fixture,
+            dispatch_packet=fixture["workspace_packet_path"],
+            sandbox="workspace-write",
+            tool_mode="default",
+            mutation_authorized=True,
+        ),
+        CLI=FakeClaudeCLI,
+    )
+    assert result["status"] == "COMPLETED"
+    command = FakeClaudeCLI.calls[-1]["command"]
+    assert command[command.index("--permission-mode") + 1] == "acceptEdits"
+
+    granted = command[command.index("--allowedTools") + 1].split(",")
+    assert granted == list(DISPATCH.WORKSPACE_VERIFICATION_ALLOWED_TOOLS)
+    # bounded verification, not host-wide execution: every grant names a
+    # build/test/lint runner, none is the bare tool or a raw interpreter.
+    assert "Bash(pytest:*)" in granted
+    assert "Bash(npm test:*)" in granted
+    for pattern in granted:
+        assert pattern.startswith("Bash(") and pattern.endswith(":*)")
+    forbidden = {
+        "Bash",
+        "Bash(:*)",
+        "Bash(bash:*)",
+        "Bash(curl:*)",
+        "Bash(git push:*)",
+        "Bash(npm publish:*)",
+        "Bash(pip install:*)",
+        "Bash(python:*)",
+        "Bash(python3:*)",
+        "Bash(sh:*)",
+        "Bash(sudo:*)",
+    }
+    assert not forbidden & set(granted)
+
+    # the packet withheld network access, so the model's egress tools are denied
+    denied = command[command.index("--disallowedTools") + 1].split(",")
+    assert denied == ["WebFetch", "WebSearch"]
+
+    receipt = DISPATCH.read_registry_receipts()[-1]
+    assert receipt["permission_mode"] == "acceptEdits"
+    assert receipt["allowed_tools"] == list(
+        DISPATCH.WORKSPACE_VERIFICATION_ALLOWED_TOOLS
+    )
+    assert receipt["disallowed_tools"] == ["WebFetch", "WebSearch"]
+    assert receipt["sandbox"] == "workspace-write"
+    assert receipt["mutation_authorized"] is True
+
+    # a workspace-write lane the packet did not authorize to mutate gets no
+    # execution grant, and neither does a `none` tool mode
+    mode, denials, grants = DISPATCH.permission_flags(
+        {
+            "sandbox": "workspace-write",
+            "tool_mode": "default",
+            "network_access": True,
+            "mutation_authorized": False,
+        }
+    )
+    assert (mode, denials, grants) == ("acceptEdits", (), ())
+    assert DISPATCH.permission_flags(
+        {
+            "sandbox": "workspace-write",
+            "tool_mode": "none",
+            "network_access": False,
+            "mutation_authorized": True,
+        }
+    ) == ("acceptEdits", DISPATCH.TOOL_MODE_NONE_DISALLOWED_TOOLS, ())
+
+    # read-only lanes are unchanged: plan mode, the same denials, no grant
+    for tool_mode, expected in (
+        ("default", DISPATCH.READ_ONLY_DISALLOWED_TOOLS),
+        ("none", DISPATCH.TOOL_MODE_NONE_DISALLOWED_TOOLS),
+    ):
+        assert DISPATCH.permission_flags(
+            {
+                "sandbox": "read-only",
+                "tool_mode": tool_mode,
+                "network_access": False,
+                "mutation_authorized": True,
+            }
+        ) == ("plan", expected, ())
+    read_only = DISPATCH.command_run(run_args(fixture), CLI=FakeClaudeCLI)
+    assert read_only["status"] == "COMPLETED"
+    read_only_command = FakeClaudeCLI.calls[-1]["command"]
+    assert "--allowedTools" not in read_only_command
+    assert read_only_command[read_only_command.index("--permission-mode") + 1] == (
+        "plan"
+    )
+    assert read_only_command[
+        read_only_command.index("--disallowedTools") + 1
+    ].split(",") == list(DISPATCH.TOOL_MODE_NONE_DISALLOWED_TOOLS)
+    reset_fake()
 
 
 def test_terminal_result_is_mandatory(fixture: dict[str, Any]) -> None:
@@ -458,6 +638,62 @@ def test_check_reports_router_admission_fields() -> None:
     assert report["resumption"] == "ABORTED_NO_RESUMABLE_CHECKPOINT"
 
 
+def test_wall_time_timeout_retains_partial_stream_and_aborted_receipt(
+    fixture: dict[str, Any],
+) -> None:
+    reset_fake()
+    partial = '{"type": "system", "subtype": "init", "session_id": "sess-timeout"}\n'
+    FakeClaudeCLI.timeout_partial = partial
+    try:
+        DISPATCH.command_run(run_args(fixture), CLI=FakeClaudeCLI)
+    except DISPATCH.DispatchError as error:
+        assert "wall-time" in str(error), str(error)
+    else:  # pragma: no cover
+        raise AssertionError("timeout did not raise DispatchError")
+
+    # partial stream must be retained on disk
+    receipts = DISPATCH.read_registry_receipts()
+    receipt = receipts[-1]
+    stream_path = Path(receipt["stream_path"])
+    assert stream_path.exists(), "stream file was not retained"
+    assert stream_path.read_bytes() == partial.encode("utf-8")
+
+    # receipt fields
+    assert receipt["status"] == "ABORTED_WALL_TIME"
+    assert receipt["execution_identity"] == "ABORTED_NO_RESUMABLE_CHECKPOINT"
+    expected_sha = hashlib.sha256(partial.encode("utf-8")).hexdigest()
+    assert receipt["stream_sha256"] == expected_sha
+    assert receipt["stream_event_count"] == 1  # one parseable JSON line
+
+    # receipt chain still validates (read_registry_receipts would raise on mismatch)
+    DISPATCH.read_registry_receipts()
+    reset_fake()
+
+
+def test_close_tree_status_vocabulary_matches_governance() -> None:
+    parser = DISPATCH.build_parser()
+
+    # accepted uppercase choices parse without error
+    for good in ("COMPLETED", "ABORTED", "BLOCKED"):
+        args = parser.parse_args(["close-tree", "--lease-id", "x", "--status", good])
+        assert args.status == good
+
+    # lowercase and removed choices are rejected by argparse
+    for bad in ("completed", "failed", "aborted"):
+        try:
+            parser.parse_args(["close-tree", "--lease-id", "x", "--status", bad])
+        except SystemExit:
+            pass
+        else:  # pragma: no cover
+            raise AssertionError(f"--status {bad!r} was accepted but should be rejected")
+
+    # every accepted choice is in the governance TERMINAL_STATUSES
+    for choice in ("COMPLETED", "ABORTED", "BLOCKED"):
+        assert choice in DISPATCH.governance.TERMINAL_STATUSES, (
+            f"{choice!r} missing from governance.TERMINAL_STATUSES"
+        )
+
+
 def main() -> int:
     test_flag_assembly_is_exact()
     test_max_effort_is_refused_not_downgraded()
@@ -466,11 +702,12 @@ def main() -> int:
         root = Path(temporary)
         fixture = build_fixture(root / "repo")
         test_run_retains_stream_extracts_metadata_and_chains_receipts(fixture)
-        DISPATCH.EXECUTION_REGISTRY.unlink(missing_ok=True)
+        test_workspace_write_lane_can_verify_without_host_execution(fixture)
         test_terminal_result_is_mandatory(fixture)
-        DISPATCH.EXECUTION_REGISTRY.unlink(missing_ok=True)
         test_packet_and_permission_drift_are_rejected(fixture)
         test_install_journal_admission_blocks_executable_commands(root)
+        test_wall_time_timeout_retains_partial_stream_and_aborted_receipt(fixture)
+    test_close_tree_status_vocabulary_matches_governance()
     print("claude workflow-dispatch tests passed")
     return 0
 
