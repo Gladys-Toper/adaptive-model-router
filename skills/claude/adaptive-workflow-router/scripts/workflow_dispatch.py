@@ -85,6 +85,7 @@ RUNTIME_LABEL = "claude-code-headless-cli"
 MODEL_TIERS = {"T1", "T2", "T3", "T4"}
 HEADLESS_EFFORTS = ("low", "medium", "high")
 UNVERSIONED_SOURCE_COMMIT = "0" * 40
+DISPATCH_TIMEOUT_RETURNCODE = -9001  # sentinel: wall-time cap expired before process exit
 HEX_SHA256 = re.compile(r"[0-9a-f]{64}")
 ADMISSION_COMMANDS = {
     "run",
@@ -107,6 +108,71 @@ TOOL_MODE_NONE_DISALLOWED_TOOLS = (
     "Task",
     "WebFetch",
     "WebSearch",
+)
+# Egress tools are the model's own network lane, so a packet that withholds
+# network access must withhold them too.  Applied to executing (workspace-write)
+# lanes; read-only lanes keep exactly the posture they already had.
+NETWORK_DENIED_TOOLS = ("WebFetch", "WebSearch")
+# Bounded in-worktree verification vocabulary.
+#
+# ``acceptEdits`` auto-approves file edits but *not* ``Bash``: a mutating phase
+# under it produces "This command requires approval" for every test command and
+# print mode has no channel to answer, so the worker could implement but never
+# verify its own change (harness issue #24 item 2).  The two ways to grant Bash
+# headlessly are measured, not assumed (``claude -p`` probes, CLI 2026-08):
+#
+# * ``--permission-mode dontAsk`` alone does *not* unblock it - Bash comes back
+#   "denied because Claude Code is running in don't ask mode".  It needs the
+#   same explicit allow rules, so it buys nothing here and gives up the edit
+#   auto-approval the lane exists for.
+# * ``--permission-mode acceptEdits`` plus ``--allowedTools`` prefix rules does
+#   unblock exactly the enumerated commands, and nothing else.
+#
+# So the posture is acceptEdits + this frozen allowlist.  Containment rests on
+# three properties: every entry names a build/test/lint runner rather than a
+# shell (no bare ``Bash``, no ``Bash(python3:*)`` - the CLI treats inline-code
+# forms such as ``python3 -c ...`` as unmatched and still refuses them, which is
+# the behavior we want); nothing here installs, publishes, escalates, or mutates
+# version control; and the list is source, not a caller input, so a dispatch
+# packet can never widen execution authority - only a reviewed change to these
+# bytes, which the frozen release binding hashes, can.  Anything outside the
+# vocabulary still fails closed and shows up in the retained stream.
+WORKSPACE_VERIFICATION_ALLOWED_TOOLS = (
+    "Bash(cargo build:*)",
+    "Bash(cargo check:*)",
+    "Bash(cargo clippy:*)",
+    "Bash(cargo test:*)",
+    "Bash(git diff:*)",
+    "Bash(git status:*)",
+    "Bash(go build:*)",
+    "Bash(go test:*)",
+    "Bash(go vet:*)",
+    "Bash(just check:*)",
+    "Bash(just lint:*)",
+    "Bash(just test:*)",
+    "Bash(make check:*)",
+    "Bash(make lint:*)",
+    "Bash(make test:*)",
+    "Bash(make typecheck:*)",
+    "Bash(mypy:*)",
+    "Bash(npm run build:*)",
+    "Bash(npm run lint:*)",
+    "Bash(npm run test:*)",
+    "Bash(npm run typecheck:*)",
+    "Bash(npm test:*)",
+    "Bash(npx eslint:*)",
+    "Bash(npx jest:*)",
+    "Bash(npx prettier:*)",
+    "Bash(npx tsc:*)",
+    "Bash(npx vitest:*)",
+    "Bash(pytest:*)",
+    "Bash(python -m compileall:*)",
+    "Bash(python -m pytest:*)",
+    "Bash(python -m unittest:*)",
+    "Bash(python3 -m compileall:*)",
+    "Bash(python3 -m pytest:*)",
+    "Bash(python3 -m unittest:*)",
+    "Bash(ruff:*)",
 )
 
 canonical_json = planner.canonical_json
@@ -417,6 +483,7 @@ class ClaudeCLI:
         max_budget_usd: float,
         permission_mode: str,
         disallowed_tools: tuple[str, ...],
+        allowed_tools: tuple[str, ...] = (),
     ) -> list[str]:
         if effort not in HEADLESS_EFFORTS:
             raise DispatchError(
@@ -432,11 +499,21 @@ class ClaudeCLI:
             effort,
             "--output-format",
             "stream-json",
+            # The CLI requires --verbose whenever --print emits stream-json;
+            # without it the process exits before any event is produced.
+            "--verbose",
             "--max-budget-usd",
             f"{max_budget_usd:.4f}",
             "--permission-mode",
             permission_mode,
         ]
+        # `--allowedTools`/`--disallowedTools` are variadic in the CLI, so they
+        # stay last and the prompt stays on stdin: a positional prompt after
+        # either flag is swallowed as another tool pattern and the process exits
+        # with "Input must be provided". Comma-joining is the documented form and
+        # preserves patterns that contain spaces (`Bash(npm test:*)`).
+        if allowed_tools:
+            command += ["--allowedTools", ",".join(allowed_tools)]
         if disallowed_tools:
             command += ["--disallowedTools", ",".join(disallowed_tools)]
         return command
@@ -449,15 +526,35 @@ class ClaudeCLI:
         cwd: Path,
         timeout: int,
     ) -> tuple[int, str, str]:
-        completed = subprocess.run(
-            command,
-            input=prompt,
-            text=True,
-            capture_output=True,
-            cwd=str(cwd),
-            timeout=timeout,
-        )
-        return completed.returncode, completed.stdout, completed.stderr
+        # The CLI refuses to start when it believes it is nested inside another
+        # Claude Code session (CLAUDECODE guard). Headless dispatch children are
+        # independent print-mode processes, so scrub the marker from their
+        # environment; every other variable passes through unchanged.
+        child_env = {k: v for k, v in os.environ.items() if k != "CLAUDECODE"}
+        try:
+            completed = subprocess.run(
+                command,
+                input=prompt,
+                text=True,
+                capture_output=True,
+                cwd=str(cwd),
+                timeout=timeout,
+                env=child_env,
+            )
+            return completed.returncode, completed.stdout, completed.stderr
+        except subprocess.TimeoutExpired as exc:
+            # Normalize partial output: bytes → str, None → empty string.
+            partial_stdout = (
+                exc.stdout.decode("utf-8", errors="replace")
+                if isinstance(exc.stdout, bytes)
+                else (exc.stdout or "")
+            )
+            partial_stderr = (
+                exc.stderr.decode("utf-8", errors="replace")
+                if isinstance(exc.stderr, bytes)
+                else (exc.stderr or "")
+            )
+            return DISPATCH_TIMEOUT_RETURNCODE, partial_stdout, partial_stderr
 
 
 def parse_stream(raw: str) -> tuple[list[dict[str, Any]], dict[str, Any]]:
@@ -601,18 +698,35 @@ def verify_runtime_contract(
     return contract
 
 
-def permission_flags(contract: dict[str, Any]) -> tuple[str, tuple[str, ...]]:
+def permission_flags(
+    contract: dict[str, Any],
+) -> tuple[str, tuple[str, ...], tuple[str, ...]]:
+    """Spell the bound runtime contract as CLI permission flags.
+
+    Returns ``(permission_mode, disallowed_tools, allowed_tools)``.  Every axis
+    is derived from the packet and never widened past it: a ``none`` tool mode
+    denies the whole mutating/agentic set and grants nothing, a read-only lane
+    keeps its existing plan-mode posture untouched, and only a workspace-write
+    lane that the packet *also* marks ``mutation_authorized`` receives the
+    bounded verification vocabulary that lets it run its own tests in its own
+    cwd (``WORKSPACE_VERIFICATION_ALLOWED_TOOLS``).  Withheld network access
+    additionally revokes the model's egress tools on that executing lane.
+    """
     sandbox = contract.get("sandbox")
     if sandbox not in SANDBOX_PERMISSION_MODE:
         raise DispatchError(f"unsupported sandbox: {sandbox}")
     permission_mode = SANDBOX_PERMISSION_MODE[sandbox]
     if contract.get("tool_mode") == "none":
-        disallowed = TOOL_MODE_NONE_DISALLOWED_TOOLS
-    elif sandbox == "read-only":
-        disallowed = READ_ONLY_DISALLOWED_TOOLS
-    else:
-        disallowed = ()
-    return permission_mode, disallowed
+        return permission_mode, TOOL_MODE_NONE_DISALLOWED_TOOLS, ()
+    if sandbox == "read-only":
+        return permission_mode, READ_ONLY_DISALLOWED_TOOLS, ()
+    disallowed = () if contract.get("network_access") else NETWORK_DENIED_TOOLS
+    allowed = (
+        WORKSPACE_VERIFICATION_ALLOWED_TOOLS
+        if contract.get("mutation_authorized")
+        else ()
+    )
+    return permission_mode, disallowed, allowed
 
 
 def budget_usd_for(resolution: dict[str, Any], contract: dict[str, Any]) -> float:
@@ -696,7 +810,7 @@ def command_run(args: argparse.Namespace, *, CLI: type[ClaudeCLI] = ClaudeCLI) -
     if status.get("policy_id") != plan.get("router_policy_id"):
         raise DispatchError("active router policy drifted from the planned policy")
 
-    permission_mode, disallowed = permission_flags(contract)
+    permission_mode, disallowed, allowed = permission_flags(contract)
     budget = budget_usd_for(resolution, contract)
     client = CLI()
     command = client.build_command(
@@ -705,6 +819,7 @@ def command_run(args: argparse.Namespace, *, CLI: type[ClaudeCLI] = ClaudeCLI) -
         max_budget_usd=budget,
         permission_mode=permission_mode,
         disallowed_tools=disallowed,
+        allowed_tools=allowed,
     )
 
     run_id = uuid.uuid4().hex
@@ -728,6 +843,62 @@ def command_run(args: argparse.Namespace, *, CLI: type[ClaudeCLI] = ClaudeCLI) -
     _atomic_private_bytes(stream_path, stream_bytes)
     stream_sha256 = sha256_bytes(stream_bytes)
 
+    if returncode == DISPATCH_TIMEOUT_RETURNCODE:
+        cap = int(contract["wall_time_seconds"])
+        stream_event_count = 0
+        for _ln in stdout.splitlines():
+            if not _ln.strip():
+                continue
+            try:
+                json.loads(_ln)
+                stream_event_count += 1
+            except json.JSONDecodeError:
+                pass
+        receipt = append_registry_receipt(
+            "execution",
+            {
+                "runtime": RUNTIME_LABEL,
+                "evidence_source": EVIDENCE_SOURCE_STREAM,
+                "evidence_grade": EVIDENCE_GRADE,
+                "issued_at": utc_now(),
+                "run_id": run_id,
+                "plan_id": plan["plan_id"],
+                "phase_key": phase["phase_key"],
+                "workflow_id": resolution.get("workflow_id"),
+                "workflow_version": resolution.get("workflow_version"),
+                "phase_id": resolution.get("phase_id"),
+                "router_policy_id": plan.get("router_policy_id"),
+                "dispatch_packet_sha256": packet["dispatch_packet_sha256"],
+                "phase_contract_sha256": packet["phase_contract_sha256"],
+                "prompt_sha256": packet["prompt_sha256"],
+                "source_commit": packet["source_commit"],
+                "tier": tier,
+                "requested_model": resolution["model"],
+                "requested_effort": effort,
+                "execution_identity": "ABORTED_NO_RESUMABLE_CHECKPOINT",
+                "command": command,
+                "permission_mode": permission_mode,
+                "disallowed_tools": list(disallowed),
+                "allowed_tools": list(allowed),
+                "max_budget_usd": budget,
+                "sandbox": contract["sandbox"],
+                "tool_mode": contract["tool_mode"],
+                "network_access": bool(contract["network_access"]),
+                "mutation_authorized": bool(contract["mutation_authorized"]),
+                "stream_path": str(stream_path),
+                "stream_sha256": stream_sha256,
+                "stream_event_count": stream_event_count,
+                "elapsed_ms": elapsed_ms,
+                "status": "ABORTED_WALL_TIME",
+                "wall_time_seconds": cap,
+                "scored_evidence_status": "BLOCKED_MODEL_ENFORCEMENT",
+            },
+        )
+        raise DispatchError(
+            f"claude headless dispatch exceeded its {cap}s wall-time cap; "
+            f"partial stream retained at {stream_path}; "
+            f"aborted receipt {receipt['receipt_sha256'][:12]}"
+        )
     if returncode != 0:
         raise DispatchError(
             "claude headless dispatch failed: " + (stderr.strip() or "unknown error")
@@ -765,6 +936,7 @@ def command_run(args: argparse.Namespace, *, CLI: type[ClaudeCLI] = ClaudeCLI) -
             "command": command,
             "permission_mode": permission_mode,
             "disallowed_tools": list(disallowed),
+            "allowed_tools": list(allowed),
             "max_budget_usd": budget,
             "sandbox": contract["sandbox"],
             "tool_mode": contract["tool_mode"],
@@ -951,7 +1123,7 @@ def build_parser() -> argparse.ArgumentParser:
     close_tree = commands.add_parser("close-tree", help="Close a governed agent tree")
     close_tree.add_argument("--lease-id", required=True)
     close_tree.add_argument(
-        "--status", choices=("completed", "failed", "aborted"), default="completed"
+        "--status", choices=("COMPLETED", "ABORTED", "BLOCKED"), required=True
     )
     close_tree.add_argument("--reason", default="")
 
