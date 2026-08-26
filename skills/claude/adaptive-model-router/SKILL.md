@@ -1,11 +1,32 @@
 ---
 name: adaptive-model-router
-description: Route Claude Code work to the smallest proven Claude model and reasoning effort for each phase, discover newly available Claude models from the curated catalog, and reoptimize routing through paired evals, measured outcomes, promotion gates, and exact rollback. Use when choosing models or reasoning effort for subagents or workflows, dispatching via the Agent tool or Workflow tool, coordinating multi-agent work, controlling cost or latency, assigning planning and implementation, polling CI or PRs, handling release operations, evaluating a newly available Claude model, or checking whether the current model policy remains optimal.
+description: Route harness-eligible Claude Code work to the smallest proven model and reasoning effort for each phase, with measured promotion and exact rollback. Use when the user explicitly requests adaptive routing or work needs model or effort selection, dependent multi-agent coordination, multiple material phases, resumption or recurrence, cross-system coordination or judgment, consequential action, or evidence-heavy adjudication. Do not use for low-risk work clearly bounded to the current turn when one agent—or only a small independent read-only fan-out—can complete it without cross-system coordination or judgment.
 ---
 
 # Adaptive Model Router
 
 Spend reasoning on the phases that need it. Keep model selection adaptive, evidence-backed, and reversible.
+
+## Activation boundary
+
+- Keep work direct only when it is low-risk and clearly bounded to the current
+  turn, needs no cross-system coordination or judgment, and either one agent
+  can finish it or a small fan-out is limited to independent, bounded read-only
+  scans or reviews. A short inspection, local edit, focused test, exact status
+  read, or mechanical PR creation from prepared inputs can remain direct.
+- Activate this harness when the user explicitly requests it or when work is
+  materially multi-phase, needs dependent multi-agent coordination, is
+  long-running or resumable, is recurring or monitored, needs cross-system
+  coordination or judgment, is consequential or high-risk, or depends on
+  evidence-heavy/conflict-bearing judgment.
+- Risk overrides apparent simplicity. Merge or deploy decisions and actions,
+  destructive operations, security or authorization judgments or changes,
+  billing changes, and schema or data migrations always activate the harness,
+  even when the immediate command is short.
+- Once activated, all routing, dispatch, evidence, budget, and authority rules
+  in this skill and `adaptive-workflow-router` are mandatory. Direct work is
+  outside T0-T4 and creates no harness plan, receipt, governance ledger entry,
+  or adaptive-routing claim.
 
 ## Operating contract
 
@@ -19,7 +40,7 @@ Spend reasoning on the phases that need it. Keep model selection adaptive, evide
 
 ## Load the active route
 
-Load the route once per session, not once per decision: run `python3 scripts/router_lab.py status` at the first routing decision, then reuse its assignments until a route fails, the policy changes, or the session is told otherwise. Fast path: for one or two dispatches, route directly from the table below; invoke the scripts only for multi-phase work, machine-readable phase requests, or after a routing failure. Run `python3 scripts/router_lab.py refresh --stage-new` only when the catalog baseline is absent or `assets/claude-catalog.json` was edited.
+After activation, load the route once per session, not once per decision: run `python3 scripts/router_lab.py status` at the first adaptive routing decision, then reuse its assignments until a route fails, the policy changes, or the session is told otherwise. Do not load router state merely to classify direct work. Fast path: for one or two dispatches, route directly from the table below; invoke the scripts only for multi-phase work, machine-readable phase requests, or after a routing failure. Run `python3 scripts/router_lab.py refresh --stage-new` only when the catalog baseline is absent or `assets/claude-catalog.json` was edited.
 
 Use the four active assignments returned by the lab:
 
@@ -33,7 +54,7 @@ Use the four active assignments returned by the lab:
 
 Require exact `max` support for a new T4 challenger. A model without image input may serve T1 only when the phase has no image or visual-inspection requirement; keep it out of T2-T4. All currently cataloged Claude models accept image input, so this floor is presently inactive; retain it for future catalog entries.
 
-T4 is the per-agent equivalent of the session effort slider's Ultracode position: `max` is the deepest effort expressible in agent frontmatter and Workflow calls. Ultracode itself is a session posture (deepest effort plus a standing multi-agent orchestration opt-in), not a routable effort value. Under Ultracode, this policy is what keeps exhaustive from meaning extravagant: scale coverage with more T1 and T2 workers, not top-tier models on mechanical work.
+T4 is the per-agent equivalent of the session effort slider's Ultracode position: `max` is the deepest effort expressible in agent frontmatter and Workflow calls. Ultracode itself is a session posture (deepest effort plus a standing multi-agent orchestration opt-in), not a routable effort value. T4 is direction-only: it is read-only and cannot carry a patch, mutation grant, deployment instruction, or external-action authorization. A grounded cognitive failure deterministically selects `t4_consult` when its retained evidence is complete and internally consistent, or `t4_diagnose` when that evidence is incomplete or contradictory. `authority_required` selects `ask_user`; it never dispatches T4. Any resulting write must use a freshly planned and bound T3-or-lower packet that consumes and revalidates the bounded T4 direction contract. Under Ultracode, this policy is what keeps exhaustive from meaning extravagant: scale coverage with more T1 and T2 workers, not top-tier models on mechanical work.
 
 ## Route the work
 
@@ -57,7 +78,7 @@ router_lab.py resolve-phase --request REQUEST.json
 cat REQUEST.json | router_lab.py resolve-phase --request -
 ```
 
-The response binds the route to the active policy and profile hash. `REQUESTED_NOT_ATTESTED` means the route is selected but the actual runtime model still requires trusted execution metadata; never treat the requested identity as proof of execution.
+The response binds the route to the active policy and profile hash. `REQUESTED_PENDING_RUNTIME_METADATA` means the route is selected but the actual runtime model still requires retained dispatcher metadata; never treat the requested identity as proof of execution. `REQUESTED_NOT_ATTESTED` remains only for the external-verifier compatibility contract.
 
 ## Apply risk floors
 
@@ -81,11 +102,12 @@ The response binds the route to the active policy and profile hash. `REQUESTED_N
 
 ## Escalate and recover
 
-- Retry a transient tool, network, or provider error at the same tier.
-- Escalate one tier after a reasoning miss, missed constraint, contradictory conclusion, or unverifiable plan.
-- Do not repeat the same failed cognitive prompt more than once at one tier.
-- Send conflicting lower-tier conclusions to T3; use T4 only for materially complex or high-risk conflicts.
-- De-escalate after the plan, invariant, or exact command is established.
+Consume `workflow_dispatch.py pivot-from-receipt` from a validated terminal control-return; it is deterministic and cannot grant authority, mutate, or enlarge a budget.
+
+- Repair a deterministic setup failure at T0, once; a repeated identical failure is a parent-visible harness incident.
+- Retry one transient failure at the same route, or resume only from a validated checkpoint where the surface supports it. Claude headless dispatch refuses resumption.
+- Escalate one tier after an exit-gate failure. For every grounded cognitive failure, pivot deterministically to `t4_consult` with complete, internally consistent evidence or to `t4_diagnose` with incomplete or contradictory evidence; do not make this conditional on the failed tier or repeated failures. T4 only returns bounded direction. Any mutation needs a freshly planned and bound T3-or-lower packet that consumes and revalidates that direction contract.
+- Return missing authority as an exact user/parent question, partition budget or context exhaustion before retrying, and surface harness unavailability as read-only break-glass evidence.
 
 ## Reoptimize the policy
 

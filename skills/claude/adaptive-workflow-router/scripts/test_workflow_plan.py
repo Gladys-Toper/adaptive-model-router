@@ -87,6 +87,8 @@ def run_bind(*arguments: str, check: bool = True) -> subprocess.CompletedProcess
                     "user.name=Harness Test",
                     "-c",
                     "user.email=harness-test@example.invalid",
+                    "-c",
+                    "commit.gpgSign=false",
                     "commit",
                     "--allow-empty",
                     "-qm",
@@ -227,6 +229,42 @@ def test_visual_and_risk_routing() -> None:
     assert phase(hard, "planning.decision:frame")["route_resolution"]["tier"] == "T4"
 
 
+def test_model_phase_token_caps_are_structured_and_reproducible() -> None:
+    plan = run_plan("--application", "coding", "--objective", "bounded route")
+    model_phases = [
+        item
+        for item in plan["phases"]
+        if item.get("route_resolution", {}).get("mode") == "model"
+    ]
+    assert model_phases
+    for item in model_phases:
+        tier = item["route_resolution"]["tier"]
+        assert item["token_budget"] == {
+            "schema_version": 1,
+            "declared_token_cap": WORKFLOW_PLAN.DEFAULT_DECLARED_TOKEN_CAP_BY_TIER[tier],
+            "declaration_source": "planner.route-default",
+        }
+
+    target = model_phases[0]["phase_key"]
+    explicit = run_plan(
+        "--application", "coding", "--objective", "bounded route",
+        "--phase-token-cap", f"{target}=1234",
+    )
+    assert phase(explicit, target)["token_budget"] == {
+        "schema_version": 1,
+        "declared_token_cap": 1234,
+        "declaration_source": "plan.phase-token-cap",
+    }
+    rejected = subprocess.run(
+        [
+            sys.executable, str(PLANNER), "plan", "--application", "coding",
+            "--objective", "bounded route", "--phase-token-cap", "missing:phase=1",
+        ], text=True, capture_output=True, check=False,
+    )
+    assert rejected.returncode != 0
+    assert "identifies no selected phase" in rejected.stderr
+
+
 def test_release_dry_run_is_read_only_even_when_routed_to_t4() -> None:
     plan = run_plan(
         "--application",
@@ -299,20 +337,30 @@ def test_release_dry_run_is_read_only_even_when_routed_to_t4() -> None:
                 "60",
             ).stdout
         )
-        assert packet["runtime_contract"] == {
-            "sandbox": "read-only",
-            "network_access": False,
-            "tool_mode": "none",
-            "mutation_authorized": False,
-            "wall_time_seconds": 60,
+        contract = packet["runtime_contract"]
+        assert {
+            key: contract[key]
+            for key in (
+                "sandbox", "network_access", "tool_mode", "mutation_authorized",
+                "wall_time_seconds", "requested_budget_limits", "declared_token_cap",
+                "derived_token_cap", "effective_token_cap", "caller_requested_token_cap",
+                "token_cap_contract_sha256", "budget_increase_contract_sha256",
+            )
+        } == {
+            "sandbox": "read-only", "network_access": False, "tool_mode": "none",
+            "mutation_authorized": False, "wall_time_seconds": 60,
             "requested_budget_limits": {
-                "token_cap": None,
-                "model_cycle_cap": None,
-                "tool_cycle_cap": None,
+                "token_cap": 64_000, "model_cycle_cap": None, "tool_cycle_cap": None,
             },
+            "declared_token_cap": 64_000, "derived_token_cap": 64_000,
+            "effective_token_cap": 64_000, "caller_requested_token_cap": None,
             "token_cap_contract_sha256": None,
             "budget_increase_contract_sha256": None,
         }
+        assert all(
+            isinstance(contract[key], str) and len(contract[key]) == 64
+            for key in ("token_cap_task_binding_sha256", "dispatch_packet_binding_sha256")
+        )
 
 
 def test_invalid_condition_fails_closed() -> None:
@@ -435,6 +483,7 @@ def test_dispatch_packet_binds_exact_phase_and_runtime_inputs() -> None:
             "exit_gate": routed["exit_gate"],
             "route_request": routed["route_request"],
             "route_resolution": routed["route_resolution"],
+            "token_budget": routed["token_budget"],
         }
         assert packet["phase_contract_sha256"] == WORKFLOW_PLAN.content_hash(
             phase_identity
@@ -459,23 +508,112 @@ def test_dispatch_packet_binds_exact_phase_and_runtime_inputs() -> None:
             packet["context_files"]
         )
         assert packet["cwd"] == str(cwd.resolve())
-        assert packet["runtime_contract"] == {
-            "sandbox": "read-only",
-            "network_access": False,
-            "tool_mode": "none",
-            "mutation_authorized": False,
-            "wall_time_seconds": 73,
+        runtime_contract = packet["runtime_contract"]
+        cap = routed["token_budget"]["declared_token_cap"]
+        assert {
+            key: runtime_contract[key]
+            for key in (
+                "sandbox", "network_access", "tool_mode", "mutation_authorized",
+                "wall_time_seconds", "requested_budget_limits", "declared_token_cap",
+                "derived_token_cap", "effective_token_cap", "caller_requested_token_cap",
+                "token_cap_contract_sha256", "budget_increase_contract_sha256",
+            )
+        } == {
+            "sandbox": "read-only", "network_access": False, "tool_mode": "none",
+            "mutation_authorized": False, "wall_time_seconds": 73,
             "requested_budget_limits": {
-                "token_cap": None,
-                "model_cycle_cap": None,
-                "tool_cycle_cap": None,
+                "token_cap": cap, "model_cycle_cap": None, "tool_cycle_cap": None,
             },
+            "declared_token_cap": cap, "derived_token_cap": cap,
+            "effective_token_cap": cap, "caller_requested_token_cap": None,
             "token_cap_contract_sha256": None,
             "budget_increase_contract_sha256": None,
         }
+        assert all(
+            isinstance(runtime_contract[key], str) and len(runtime_contract[key]) == 64
+            for key in ("token_cap_task_binding_sha256", "dispatch_packet_binding_sha256")
+        )
         packet_identity = dict(packet)
         packet_sha256 = packet_identity.pop("dispatch_packet_sha256")
         assert packet_sha256 == WORKFLOW_PLAN.content_hash(packet_identity)
+
+
+def test_fixed_token_cap_contract_reuse_is_bound_and_tamper_rejected() -> None:
+    """A prior cap artifact is reusable only for the same exact bind tuple."""
+    plan = run_plan("--application", "coding", "--objective", "reuse cap contract")
+    routed = next(
+        item
+        for item in plan["phases"]
+        if item.get("activation") == "active"
+        and item.get("route_resolution", {}).get("mode") == "model"
+    )
+    with tempfile.TemporaryDirectory(prefix="workflow-cap-reuse-") as temporary:
+        root = Path(temporary)
+        plan_path = root / "plan.json"
+        prompt_path = root / "prompt.txt"
+        cwd = root / "workspace"
+        contract_path = root / "fixed-cap.json"
+        plan_path.write_text(json.dumps(plan), encoding="utf-8")
+        prompt_path.write_text("Use the exact bound cap.\n", encoding="utf-8")
+        cwd.mkdir()
+        base = (
+            "--plan", str(plan_path),
+            "--phase-key", routed["phase_key"],
+            "--prompt-file", str(prompt_path),
+            "--cwd", str(cwd),
+            "--sandbox", "read-only",
+            "--tool-mode", "none",
+            "--wall-time-seconds", "60",
+        )
+        created = json.loads(
+            run_bind(
+                *base,
+                "--token-cap-contract-output", str(contract_path),
+            ).stdout
+        )
+        evidence_path = WORKFLOW_PLAN.token_caps.token_cap_evidence_path(contract_path)
+        assert contract_path.is_file() and evidence_path.is_file()
+        reused = json.loads(
+            run_bind(*base, "--token-cap-contract", str(contract_path)).stdout
+        )
+        assert reused["runtime_contract"]["token_cap_contract_sha256"] == hashlib.sha256(
+            contract_path.read_bytes()
+        ).hexdigest()
+        assert reused["runtime_contract"]["effective_token_cap"] == created[
+            "runtime_contract"
+        ]["effective_token_cap"]
+
+        # A self-rehashed evidence/contract pair with a substituted task binding
+        # remains invalid: reuse requires the freshly-derived exact binding.
+        evidence = json.loads(evidence_path.read_text(encoding="utf-8"))
+        evidence["task_binding"] = {
+            **evidence["task_binding"], "phase_key": "attacker:phase"
+        }
+        evidence["task_binding_sha256"] = WORKFLOW_PLAN.token_caps.content_hash(
+            evidence["task_binding"]
+        )
+        evidence["evidence_sha256"] = WORKFLOW_PLAN.token_caps.content_hash(
+            {key: value for key, value in evidence.items() if key != "evidence_sha256"}
+        )
+        evidence_raw = json.dumps(evidence, indent=2, sort_keys=True) + "\n"
+        evidence_path.write_text(evidence_raw, encoding="utf-8")
+
+        contract = json.loads(contract_path.read_text(encoding="utf-8"))
+        contract["measured_safe_evidence_sha256"] = hashlib.sha256(
+            evidence_raw.encode("utf-8")
+        ).hexdigest()
+        contract["evidence_sha256"] = evidence["evidence_sha256"]
+        contract["contract_sha256"] = WORKFLOW_PLAN.token_caps.content_hash(
+            {key: value for key, value in contract.items() if key != "contract_sha256"}
+        )
+        contract_path.write_text(
+            json.dumps(contract, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+        )
+        rejected = run_bind(
+            *base, "--token-cap-contract", str(contract_path), check=False
+        )
+        assert rejected.returncode != 0
+        assert "fixed token-cap" in rejected.stderr
 
 
 def test_resumption_lane_is_refused_on_the_claude_surface() -> None:
@@ -919,10 +1057,12 @@ if __name__ == "__main__":
         test_catalog_and_default_workflows,
         test_conditions_and_completion_frontiers,
         test_visual_and_risk_routing,
+        test_model_phase_token_caps_are_structured_and_reproducible,
         test_release_dry_run_is_read_only_even_when_routed_to_t4,
         test_invalid_condition_fails_closed,
         test_legacy_external_verifier_contract_is_narrowly_compatible,
         test_dispatch_packet_binds_exact_phase_and_runtime_inputs,
+        test_fixed_token_cap_contract_reuse_is_bound_and_tamper_rejected,
         test_resumption_lane_is_refused_on_the_claude_surface,
         test_dispatch_packet_rejects_inactive_and_unsafe_inputs,
         test_runtime_condition_activation_is_evidence_gated,

@@ -14,11 +14,17 @@ import sys
 from pathlib import Path
 from typing import Any
 
+import token_cap_contract as token_caps
+import failure_pivot_contract as failure_pivot
+
 
 SKILL_DIR = Path(__file__).resolve().parent.parent
 PLANNER_CONTRACT_VERSION = 1
 RUNTIME_ACTIVATION_CONTRACT_NAME = "adaptive-workflow.runtime-condition"
 PHASE_RESULT_CONTRACT_NAME = "adaptive-workflow.phase-result"
+# Compatibility name for cross-platform consumers; implementation stays core-owned.
+TOKEN_CAP_CONTRACT_NAME = token_caps.TOKEN_CAP_CONTRACT_NAME
+TOKEN_CAP_CONTRACT_VERSION = token_caps.TOKEN_CAP_CONTRACT_VERSION
 DEFAULT_CATALOG = SKILL_DIR / "assets" / "workflows.json"
 RESUMPTION_POLICY = SKILL_DIR / "assets" / "resumption-policy.json"
 DEFAULT_ROUTER = (
@@ -161,6 +167,16 @@ RISK_TAGS = {
 }
 WORK_ID = re.compile(r"[a-z0-9][a-z0-9._-]{0,63}")
 UNVERSIONED_SOURCE_COMMIT = "0" * 40
+
+# These are structured route defaults, not an interpretation of objective text.
+# A caller can lower them at bind time.  Raising one remains subject to the
+# existing reviewed budget-increase path in the dispatcher.
+DEFAULT_DECLARED_TOKEN_CAP_BY_TIER = {
+    "T1": 8_000,
+    "T2": 16_000,
+    "T3": 32_000,
+    "T4": 64_000,
+}
 
 ORDERS = {
     "mutation": ["none", "reversible", "persistent", "irreversible"],
@@ -869,6 +885,9 @@ def build_plan(
     if not args.objective.strip():
         raise WorkflowError("objective must be non-empty")
     selected = select_workflows(catalog, args.application)
+    explicit_phase_token_caps = parse_phase_token_caps(
+        getattr(args, "phase_token_cap", [])
+    )
     enabled = set(args.enable_condition)
     known_input_conditions = {
         phase["condition"]
@@ -956,6 +975,10 @@ def build_plan(
                 policy_ids.add(resolution["policy_id"])
                 record["route_request"] = request
                 record["route_resolution"] = resolution
+                if resolution.get("mode") == "model":
+                    record["token_budget"] = declared_token_budget(
+                        phase_key, resolution, explicit_phase_token_caps
+                    )
                 source_has_gate = any(
                     candidate.get("execution") == "parent_gate"
                     and candidate.get("authority_for") == phase["id"]
@@ -999,6 +1022,13 @@ def build_plan(
             "router policy changed while the workflow plan was resolving"
         )
     policy_id = next(iter(policy_ids), None)
+    known_phase_keys = {phase["phase_key"] for phase in phases}
+    unknown_cap_phases = sorted(set(explicit_phase_token_caps) - known_phase_keys)
+    if unknown_cap_phases:
+        raise WorkflowError(
+            "phase-token-cap identifies no selected phase: "
+            + ", ".join(unknown_cap_phases)
+        )
     overrides = {
         "scope": args.scope,
         "ambiguity": args.ambiguity,
@@ -1194,6 +1224,18 @@ def select_dispatch_phase(
             not isinstance(item, str) or not item for item in phase[field]
         ):
             raise WorkflowError(f"dispatch phase has invalid {field}: {phase_key}")
+    token_budget = phase.get("token_budget")
+    if (
+        not isinstance(token_budget, dict)
+        or set(token_budget)
+        != {"schema_version", "declared_token_cap", "declaration_source"}
+        or token_budget.get("schema_version") != 1
+        or type(token_budget.get("declared_token_cap")) is not int
+        or token_budget["declared_token_cap"] < 1
+        or token_budget.get("declaration_source")
+        not in {"plan.phase-token-cap", "planner.route-default"}
+    ):
+        raise WorkflowError(f"dispatch phase has no valid declared token cap: {phase_key}")
     return phase
 
 
@@ -1232,6 +1274,7 @@ def phase_result_contract(phase: dict[str, Any]) -> dict[str, Any]:
         "exit_gate",
         "route_request",
         "route_resolution",
+        "token_budget",
     )
     return {field: phase.get(field) for field in fields}
 
@@ -1451,6 +1494,12 @@ def verify_plan_authority(
     }
     if set(overrides) != required_overrides:
         raise WorkflowError("dispatch plan overrides are not reproducible")
+    phase_token_cap = [
+        f"{phase['phase_key']}={phase['token_budget']['declared_token_cap']}"
+        for phase in plan["phases"]
+        if isinstance(phase.get("token_budget"), dict)
+        and phase["token_budget"].get("declaration_source") == "plan.phase-token-cap"
+    ]
     regenerated = build_plan(
         catalog,
         catalog_path,
@@ -1468,6 +1517,7 @@ def verify_plan_authority(
             visual_required=overrides["visual_required"],
             current_info_required=overrides["current_info_required"],
             external_action=overrides["external_action"],
+            phase_token_cap=phase_token_cap,
         ),
     )
     regenerated = restore_legacy_router_health(regenerated, plan)
@@ -1544,6 +1594,7 @@ def phase_contract(phase: dict[str, Any]) -> dict[str, Any]:
         "exit_gate": phase["exit_gate"],
         "route_request": phase["route_request"],
         "route_resolution": phase["route_resolution"],
+        "token_budget": phase["token_budget"],
     }
 
 
@@ -1752,6 +1803,66 @@ def resolve_dispatch_cwd(path: Path) -> Path:
     return absolute.resolve(strict=True)
 
 
+def normalize_planner_authorized_mutation_scope(
+    values: list[str], cwd: Path, *, mutation_authorized: bool
+) -> list[str]:
+    """Seal an exact, existing, non-symlink mutation scope below ``cwd``.
+
+    This is parent/planner authority, not a model request.  Rejecting rather
+    than resolving aliases makes the retained relative paths unambiguous for
+    the dispatcher and for a later T4-to-T3 handoff.
+    """
+    if not mutation_authorized:
+        if values:
+            raise WorkflowError(
+                "planner-authorized-mutation-scope requires --mutation-authorized"
+            )
+        return []
+    if not values:
+        raise WorkflowError(
+            "--mutation-authorized requires a nonempty --planner-authorized-mutation-scope"
+        )
+
+    normalized: list[str] = []
+    for value in values:
+        if not isinstance(value, str) or not value:
+            raise WorkflowError("planner-authorized-mutation-scope must be a nonempty relative path")
+        try:
+            candidate_path = Path(value)
+        except (TypeError, ValueError) as error:
+            raise WorkflowError(
+                "planner-authorized-mutation-scope must be a nonempty relative path"
+            ) from error
+        if candidate_path.is_absolute() or value in {".", ".."}:
+            raise WorkflowError("planner-authorized-mutation-scope must not name the repository root")
+        parts = candidate_path.parts
+        if not parts or any(part in {"", ".", "..", ".git"} for part in parts):
+            raise WorkflowError(
+                "planner-authorized-mutation-scope must be relative and cannot traverse .git"
+            )
+        current = cwd
+        for part in parts:
+            current = current / part
+            if current.is_symlink():
+                raise WorkflowError("planner-authorized-mutation-scope cannot contain a symlink")
+            if not current.exists():
+                raise WorkflowError("planner-authorized-mutation-scope must exist beneath --cwd")
+        resolved = current.resolve(strict=True)
+        try:
+            relative = resolved.relative_to(cwd)
+        except ValueError as error:
+            raise WorkflowError(
+                "planner-authorized-mutation-scope escapes --cwd"
+            ) from error
+        if relative == Path("."):
+            raise WorkflowError("planner-authorized-mutation-scope must not name the repository root")
+        rendered = relative.as_posix()
+        if rendered in normalized:
+            raise WorkflowError("planner-authorized-mutation-scope entries must be unique")
+        normalized.append(rendered)
+    return sorted(normalized)
+
+
 def source_commit_for(cwd: Path) -> str:
     try:
         completed = subprocess.run(
@@ -1836,18 +1947,200 @@ def load_required_skills(path: Path | None, cwd: Path) -> dict[str, Any]:
     }
 
 
+# Core owns cap declaration, identity construction, and self-hash semantics.
+# The planner retains only adapter-specific path safety and artifact I/O.
+def parse_phase_token_caps(values: list[str]) -> dict[str, int]:
+    try:
+        return token_caps.parse_phase_token_caps(values)
+    except token_caps.TokenCapContractError as error:
+        raise WorkflowError(str(error)) from error
+
+
+def declared_token_budget(
+    phase_key: str, resolution: dict[str, Any], explicit_caps: dict[str, int]
+) -> dict[str, Any]:
+    try:
+        return token_caps.declared_token_budget(
+            phase_key, resolution.get("tier"), DEFAULT_DECLARED_TOKEN_CAP_BY_TIER, explicit_caps
+        )
+    except token_caps.TokenCapContractError as error:
+        raise WorkflowError(str(error)) from error
+
+
+def token_cap_binding(
+    *, plan: dict[str, Any], phase: dict[str, Any], prompt_sha256: str,
+    context_files: list[dict[str, Any]], context_bundle: dict[str, Any], cwd: Path,
+    source_commit: str, runtime_contract: dict[str, Any],
+    dispatch_packet_binding_sha256: str,
+) -> dict[str, Any]:
+    return token_caps.token_cap_binding(
+        plan_id=plan["plan_id"], phase_key=phase["phase_key"],
+        phase_contract_sha256=content_hash(phase_contract(phase)),
+        route_identity={"request": phase["route_request"], "resolution": phase["route_resolution"]},
+        prompt_sha256=prompt_sha256, context_files=context_files,
+        context_bundle=context_bundle, cwd=str(cwd), source_commit=source_commit,
+        runtime_contract=runtime_contract,
+        dispatch_packet_binding_sha256=dispatch_packet_binding_sha256,
+    )
+
+
+def token_cap_evidence_path(contract_path: Path) -> Path:
+    return token_caps.token_cap_evidence_path(contract_path)
+
+
+def build_token_cap_evidence(
+    task_binding: dict[str, Any], runtime_contract: dict[str, Any]
+) -> dict[str, Any]:
+    return token_caps.build_token_cap_evidence(task_binding, runtime_contract)
+
+
+def build_token_cap_contract(
+    task_binding: dict[str, Any], runtime_contract: dict[str, Any], evidence_path: Path
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    return token_caps.build_token_cap_contract(task_binding, runtime_contract, evidence_path)
+
+
+def load_and_validate_token_cap_contract(
+    path: Path, task_binding: dict[str, Any], runtime_contract: dict[str, Any]
+) -> tuple[Path, dict[str, Any]]:
+    resolved, raw, contract = read_bound_json(path, "fixed token-cap contract")
+    evidence_path, evidence_raw, evidence = read_bound_json(
+        Path(contract.get("measured_safe_evidence_path", "")),
+        "fixed token-cap evidence",
+    )
+    try:
+        token_caps.validate_token_cap_contract(
+            contract,
+            task_binding=task_binding,
+            runtime_contract=runtime_contract,
+            evidence=evidence,
+            evidence_raw_sha256=hashlib.sha256(evidence_raw).hexdigest(),
+        )
+    except token_caps.TokenCapContractError as error:
+        raise WorkflowError(str(error)) from error
+    if (
+        evidence_path == resolved
+        or hashlib.sha256(evidence_raw).hexdigest()
+        != contract.get("measured_safe_evidence_sha256")
+    ):
+        raise WorkflowError("fixed token-cap evidence is missing or does not bind this task")
+    del raw
+    return resolved, contract
+
+
+def write_json_artifact(path: Path, value: dict[str, Any], label: str) -> Path:
+    absolute = absolute_without_resolving(path)
+    if absolute.is_symlink():
+        raise WorkflowError(f"{label} output is unsafe: {absolute}")
+    parent = absolute.parent.resolve(strict=True)
+    target = parent / absolute.name
+    temporary = target.with_name(f".{target.name}.{content_hash(value)[:12]}.tmp")
+    if temporary.exists() or temporary.is_symlink():
+        raise WorkflowError(f"{label} temporary path is unsafe: {temporary}")
+    try:
+        temporary.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        os.replace(temporary, target)
+    except OSError:
+        if temporary.is_file() and not temporary.is_symlink():
+            temporary.unlink()
+        raise
+    return target
+
+
+def t4_pivot_admission(
+    path: Path | None,
+    *,
+    phase: dict[str, Any],
+    cwd: Path,
+    args: argparse.Namespace,
+    context_files: list[dict[str, Any]],
+    prompt: bytes,
+) -> dict[str, str] | None:
+    """Admit the only two executable T4 modes from a sealed pivot packet."""
+    tier = phase.get("route_resolution", {}).get("tier")
+    if tier != "T4":
+        if path is not None:
+            raise WorkflowError("--t4-pivot is valid only for a T4 phase")
+        return None
+    receipt_path = getattr(args, "t4_control_return", None)
+    if path is None or receipt_path is None:
+        raise WorkflowError("a T4 phase requires hash-bound --t4-pivot and --t4-control-return")
+    _, raw, pivot = read_bound_json(path, "T4 pivot")
+    try:
+        failure_pivot.validate_pivot(pivot)
+    except failure_pivot.FailurePivotContractError as error:
+        raise WorkflowError(str(error)) from error
+    if pivot.get("schema_version") != 2 or pivot.get("contract_version") != 2:
+        raise WorkflowError("legacy pivots are inspect-only and cannot admit T4 execution")
+    packet = pivot["packet"]
+    _, _, directive = read_bound_json(receipt_path, "T4 control-return")
+    try:
+        failure_pivot.validate_control_return(directive)
+        if failure_pivot.derive_pivot(directive) != pivot:
+            raise WorkflowError("T4 pivot is not the deterministic control-return pivot")
+    except failure_pivot.FailurePivotContractError as error:
+        raise WorkflowError(str(error)) from error
+    for reference in directive["evidence_references"]:
+        evidence = Path(reference["path"])
+        if not evidence.is_absolute() or evidence.is_symlink() or not evidence.is_file() or hashlib.sha256(evidence.read_bytes()).hexdigest() != reference["sha256"]:
+            raise WorkflowError("T4 control-return evidence is missing or changed")
+    expected_prompt = (failure_pivot.canonical_json({
+        "contract": "adaptive-workflow.t4-prompt", "version": 1,
+        "pivot_sha256": pivot["pivot_sha256"], "mode": packet["kind"],
+        "evidence_bundle_sha256": packet["evidence_bundle"]["evidence_bundle_sha256"],
+        "required_return": packet["required_return"],
+        "instruction": "Return only the bounded structured T4 result; do not mutate, request authority, or use network.",
+    }) + "\n").encode("utf-8")
+    if prompt != expected_prompt:
+        raise WorkflowError("T4 prompt must be the deterministic sealed pivot prompt")
+    if packet.get("kind") not in {"t4_consult", "t4_diagnose"}:
+        raise WorkflowError("T4 dispatch requires a t4_consult or t4_diagnose pivot")
+    scope = packet["repository_scope"]
+    if Path(scope["repository_path"]).expanduser().resolve() != cwd.resolve():
+        raise WorkflowError("T4 pivot repository scope does not exactly match --cwd")
+    if scope["source_commit"] != source_commit_for(cwd):
+        raise WorkflowError("T4 pivot source commit does not match --cwd")
+    limits = packet["limits"]
+    if (
+        args.sandbox != packet["sandbox"]
+        or args.network_access is not packet["network_access"]
+        or args.tool_mode != packet["tool_mode"]
+        or args.mutation_authorized is not packet["mutation_authority"]
+        or args.wall_time_seconds != limits["wall_time_seconds"]
+        or args.token_cap != limits["token_cap"]
+        or args.model_cycle_cap != limits["model_cycle_cap"]
+        or args.tool_cycle_cap != limits["tool_cycle_cap"]
+    ):
+        raise WorkflowError("T4 runtime flags must exactly equal the sealed pivot limits")
+    if phase.get("token_budget", {}).get("declared_token_cap") != limits["token_cap"]:
+        raise WorkflowError("T4 plan declared token cap must equal the sealed pivot token cap")
+    expected = {
+        (reference["path"], reference["sha256"])
+        for reference in packet["evidence_bundle"]["references"]
+    }
+    supplied = {(item["path"], item["sha256"]) for item in context_files}
+    if supplied != expected or len(context_files) != len(expected):
+        raise WorkflowError("T4 context files must be exactly the immutable pivot evidence bundle")
+    return {
+        "t4_pivot_sha256": pivot["pivot_sha256"],
+        "t4_pivot_file_sha256": hashlib.sha256(raw).hexdigest(),
+        "t4_evidence_bundle_sha256": packet["evidence_bundle"]["evidence_bundle_sha256"],
+    }
+
+
 def build_dispatch_packet(args: argparse.Namespace) -> dict[str, Any]:
     if args.wall_time_seconds < 1:
         raise WorkflowError("wall-time-seconds must be a positive integer")
     token_cap = getattr(args, "token_cap", None)
     token_cap_contract = getattr(args, "token_cap_contract", None)
+    token_cap_contract_output = getattr(args, "token_cap_contract_output", None)
     model_cycle_cap = getattr(args, "model_cycle_cap", None)
     tool_cycle_cap = getattr(args, "tool_cycle_cap", None)
     budget_increase_contract = getattr(args, "budget_increase_contract", None)
     if token_cap is not None and token_cap < 1:
         raise WorkflowError("token-cap must be a positive integer")
-    if token_cap_contract is not None and token_cap is None:
-        raise WorkflowError("token-cap-contract requires token-cap")
+    if token_cap_contract is not None and token_cap_contract_output is not None:
+        raise WorkflowError("choose token-cap-contract or token-cap-contract-output, not both")
     if model_cycle_cap is not None and model_cycle_cap < 1:
         raise WorkflowError("model-cycle-cap must be a positive integer")
     if tool_cycle_cap is not None and tool_cycle_cap < 0:
@@ -1874,14 +2167,59 @@ def build_dispatch_packet(args: argparse.Namespace) -> dict[str, Any]:
         )
     cwd = resolve_dispatch_cwd(args.cwd)
     require_authoritative_source_commit(cwd)
+    planner_authorized_mutation_scope = normalize_planner_authorized_mutation_scope(
+        args.planner_authorized_mutation_scope,
+        cwd,
+        mutation_authorized=args.mutation_authorized,
+    )
     skills = load_required_skills(args.required_skills_file, cwd)
+    t4_admission = t4_pivot_admission(
+        getattr(args, "t4_pivot", None), phase=phase, cwd=cwd, args=args,
+        context_files=context_files,
+        prompt=prompt,
+    )
+    args._t4_admission = t4_admission
 
-    def optional_hash(value: Path | None) -> str | None:
-        if value is None:
-            return None
-        resolved, raw = read_dispatch_text(value, "dispatch budget contract")
-        del resolved
-        return hashlib.sha256(raw).hexdigest()
+    declared_token_cap = phase["token_budget"]["declared_token_cap"]
+    # The planner's deterministic derived cap is the structured phase ceiling.
+    # The dispatcher may apply a stricter live envelope, but it must never raise
+    # this effective value without the separately reviewed increase contract.
+    derived_token_cap = declared_token_cap
+    caller_requested_token_cap = token_cap
+    effective_token_cap = min(
+        declared_token_cap,
+        derived_token_cap,
+        caller_requested_token_cap
+        if caller_requested_token_cap is not None
+        else declared_token_cap,
+    )
+    runtime_contract = {
+        "sandbox": args.sandbox,
+        "network_access": args.network_access,
+        "tool_mode": args.tool_mode,
+        "mutation_authorized": args.mutation_authorized,
+        "planner_authorized_mutation_scope": planner_authorized_mutation_scope,
+        "wall_time_seconds": args.wall_time_seconds,
+        "requested_budget_limits": {
+            "token_cap": effective_token_cap,
+            "model_cycle_cap": model_cycle_cap,
+            "tool_cycle_cap": tool_cycle_cap,
+        },
+        "declared_token_cap": declared_token_cap,
+        "derived_token_cap": derived_token_cap,
+        "effective_token_cap": effective_token_cap,
+        "caller_requested_token_cap": caller_requested_token_cap,
+        "token_cap_contract_sha256": None,
+        "token_cap_task_binding_sha256": None,
+        "dispatch_packet_binding_sha256": None,
+        "budget_increase_contract_sha256": None,
+        "t4_admission": t4_admission,
+    }
+    budget_increase_hash: str | None = None
+    if budget_increase_contract is not None:
+        _, raw = read_dispatch_text(budget_increase_contract, "dispatch budget increase contract")
+        budget_increase_hash = hashlib.sha256(raw).hexdigest()
+    runtime_contract["budget_increase_contract_sha256"] = budget_increase_hash
 
     identity = {
         "schema_version": 2 if resume_contract is not None else 1,
@@ -1894,28 +2232,53 @@ def build_dispatch_packet(args: argparse.Namespace) -> dict[str, Any]:
         "context_files": context_files,
         "context_bundle": context_bundle_record(context_files),
         "cwd": str(cwd),
-        "runtime_contract": {
-            "sandbox": args.sandbox,
-            "network_access": args.network_access,
-            "tool_mode": args.tool_mode,
-            "mutation_authorized": args.mutation_authorized,
-            "wall_time_seconds": args.wall_time_seconds,
-            "requested_budget_limits": {
-                "token_cap": token_cap,
-                "model_cycle_cap": model_cycle_cap,
-                "tool_cycle_cap": tool_cycle_cap,
-            },
-            "token_cap_contract_sha256": optional_hash(
-                token_cap_contract
-            ),
-            "budget_increase_contract_sha256": optional_hash(
-                budget_increase_contract
-            ),
-        },
+        "runtime_contract": runtime_contract,
         **skills,
     }
     if resume_contract is not None:
         identity["resume_contract"] = resume_contract
+    # This hash is deliberately over the complete prospective packet identity
+    # with only the yet-to-be-created cap artifact references blank.  It avoids
+    # packet -> contract -> packet recursion while still detecting a packet
+    # substitution before dispatch.
+    dispatch_packet_binding_sha256 = content_hash(identity)
+    runtime_contract["dispatch_packet_binding_sha256"] = dispatch_packet_binding_sha256
+    task_binding = token_cap_binding(
+        plan=plan,
+        phase=phase,
+        prompt_sha256=identity["prompt_sha256"],
+        context_files=context_files,
+        context_bundle=identity["context_bundle"],
+        cwd=cwd,
+        source_commit=skills["source_commit"],
+        runtime_contract=runtime_contract,
+        dispatch_packet_binding_sha256=dispatch_packet_binding_sha256,
+    )
+    runtime_contract["token_cap_task_binding_sha256"] = content_hash(task_binding)
+    if token_cap_contract_output is not None:
+        requested_contract_path = absolute_without_resolving(token_cap_contract_output)
+        contract_path = (
+            requested_contract_path.parent.resolve(strict=True)
+            / requested_contract_path.name
+        )
+        evidence_path = token_cap_evidence_path(contract_path)
+        contract, evidence = build_token_cap_contract(task_binding, runtime_contract, evidence_path)
+        write_json_artifact(evidence_path, evidence, "fixed token-cap evidence")
+        written_contract = write_json_artifact(contract_path, contract, "fixed token-cap contract")
+        runtime_contract["token_cap_contract_sha256"] = hashlib.sha256(
+            written_contract.read_bytes()
+        ).hexdigest()
+    elif token_cap_contract is not None:
+        contract_path, _ = load_and_validate_token_cap_contract(
+            token_cap_contract, task_binding, runtime_contract
+        )
+        runtime_contract["token_cap_contract_sha256"] = hashlib.sha256(
+            contract_path.read_bytes()
+        ).hexdigest()
+    else:
+        raise WorkflowError(
+            "every routed model phase requires --token-cap-contract-output or --token-cap-contract"
+        )
     return {
         **identity,
         "dispatch_packet_sha256": content_hash(identity),
@@ -2001,6 +2364,13 @@ def build_parser() -> argparse.ArgumentParser:
     plan.add_argument("--current-info-required", action="store_true")
     plan.add_argument("--external-action", action="store_true")
     plan.add_argument(
+        "--phase-token-cap",
+        action="append",
+        default=[],
+        metavar="PHASE_KEY=CAP",
+        help="Structured declared ceiling for one model phase; never inferred from prose.",
+    )
+    plan.add_argument(
         "--output",
         type=Path,
         help="Atomically retain the generated dispatch plan at this path",
@@ -2018,11 +2388,31 @@ def build_parser() -> argparse.ArgumentParser:
         "--sandbox", choices=("read-only", "workspace-write"), required=True
     )
     bind.add_argument("--network-access", action="store_true")
-    bind.add_argument("--tool-mode", choices=("default", "none"), required=True)
+    bind.add_argument("--tool-mode", choices=("default", "none", "read_only"), required=True)
+    bind.add_argument(
+        "--t4-pivot", type=Path,
+        help="Sealed pivot required for an executable t4_consult or t4_diagnose bind.",
+    )
+    bind.add_argument("--t4-control-return", type=Path)
     bind.add_argument("--mutation-authorized", action="store_true")
+    bind.add_argument(
+        "--planner-authorized-mutation-scope",
+        action="append",
+        default=[],
+        metavar="RELATIVE_PATH",
+        help=(
+            "Exact existing non-symlink path below --cwd that the parent authorizes "
+            "for mutation; repeatable and required with --mutation-authorized."
+        ),
+    )
     bind.add_argument("--wall-time-seconds", type=int, required=True)
     bind.add_argument("--token-cap", type=int)
     bind.add_argument("--token-cap-contract", type=Path)
+    bind.add_argument(
+        "--token-cap-contract-output",
+        type=Path,
+        help="Create the self-hashed task-bound fixed cap contract and its evidence.",
+    )
     bind.add_argument("--model-cycle-cap", type=int)
     bind.add_argument("--tool-cycle-cap", type=int)
     bind.add_argument("--budget-increase-contract", type=Path)

@@ -98,7 +98,18 @@ def build_fixture(root: Path) -> dict[str, Any]:
     """Produce a real plan + real planner-bound dispatch packet."""
     subprocess.run(["git", "init", "-q", str(root)], check=True)
     subprocess.run(
-        ["git", "-C", str(root), "commit", "-q", "--allow-empty", "-m", "fixture"],
+        [
+            "git",
+            "-C",
+            str(root),
+            "-c",
+            "commit.gpgSign=false",
+            "commit",
+            "-q",
+            "--allow-empty",
+            "-m",
+            "fixture",
+        ],
         check=True,
         env={**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t",
              "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t"},
@@ -117,6 +128,7 @@ def build_fixture(root: Path) -> dict[str, Any]:
     )
     plan_path = root / "plan.json"
     prompt_path = root / "prompt.txt"
+    cap_contract_path = root / "packet.cap.json"
     plan_path.write_text(json.dumps(plan), encoding="utf-8")
     prompt_path.write_text("Frame the change.\n", encoding="utf-8")
     packet = json.loads(
@@ -136,6 +148,8 @@ def build_fixture(root: Path) -> dict[str, Any]:
             "none",
             "--wall-time-seconds",
             "60",
+            "--token-cap-contract-output",
+            str(cap_contract_path),
         ).stdout
     )
     packet_path = root / "packet.json"
@@ -160,6 +174,8 @@ def build_fixture(root: Path) -> dict[str, Any]:
             "--mutation-authorized",
             "--wall-time-seconds",
             "60",
+            "--token-cap-contract-output",
+            str(root / "workspace.cap.json"),
         ).stdout
     )
     workspace_packet_path = root / "workspace-packet.json"
@@ -171,8 +187,10 @@ def build_fixture(root: Path) -> dict[str, Any]:
         "prompt_path": prompt_path,
         "packet": packet,
         "packet_path": packet_path,
+        "cap_contract_path": cap_contract_path,
         "workspace_packet": workspace_packet,
         "workspace_packet_path": workspace_packet_path,
+        "workspace_cap_contract_path": root / "workspace.cap.json",
         "root": root,
     }
 
@@ -188,6 +206,8 @@ def run_args(fixture: dict[str, Any], **overrides: Any) -> argparse.Namespace:
         "tool_mode": "none",
         "mutation_authorized": False,
         "wall_time_seconds": 60,
+        "token_cap": None,
+        "token_cap_contract": fixture["cap_contract_path"],
     }
     values.update(overrides)
     return argparse.Namespace(**values)
@@ -342,7 +362,16 @@ def test_run_retains_stream_extracts_metadata_and_chains_receipts(
         "claude-code-headless-metadata"
     )
     assert receipt["observed_models"] == ["sonnet"]
+    assert receipt["observed_usage"] == {
+        "input_tokens": 100, "output_tokens": 50, "total_tokens": 150,
+    }
     assert receipt["previous_receipt_sha256"] == "0" * 64
+    control_path = Path(first["control_return_path"])
+    assert control_path.exists()
+    assert first["control_return"]["failure_class"] == "completed"
+    assert first["control_return"]["directive_sha256"] == json.loads(
+        control_path.read_text(encoding="utf-8")
+    )["directive_sha256"]
 
     second = DISPATCH.command_run(run_args(fixture), CLI=FakeClaudeCLI)
     chain = DISPATCH.read_registry_receipts()
@@ -385,6 +414,7 @@ def test_workspace_write_lane_can_verify_without_host_execution(
         run_args(
             fixture,
             dispatch_packet=fixture["workspace_packet_path"],
+            token_cap_contract=fixture["workspace_cap_contract_path"],
             sandbox="workspace-write",
             tool_mode="default",
             mutation_authorized=True,
@@ -490,11 +520,189 @@ def test_terminal_result_is_mandatory(fixture: dict[str, Any]) -> None:
         DISPATCH.command_run(run_args(fixture), CLI=FakeClaudeCLI)
     except DISPATCH.DispatchError as error:
         assert "terminal error result" in str(error)
+        assert "typed control return" in str(error)
     else:  # pragma: no cover
         raise AssertionError("an error result was accepted")
+    receipt = DISPATCH.read_registry_receipts()[-1]
+    assert receipt["terminal_category"] == "BUDGET_STOP"
+    assert receipt["status"] == "ABORTED"
+    assert (Path(receipt["stream_path"]).parent / "control-return.json").exists()
     reset_fake()
 
 
+def test_cumulative_usage_cap_and_missing_usage_fail_closed(
+    fixture: dict[str, Any],
+) -> None:
+    """The CLI's terminal usage is checked against the bound effective cap."""
+    reset_fake()
+    FakeClaudeCLI.result_overrides = {
+        "usage": {"input_tokens": 100, "output_tokens": 50}
+    }
+    try:
+        DISPATCH.command_run(run_args(fixture, token_cap=149), CLI=FakeClaudeCLI)
+    except DISPATCH.DispatchError as error:
+        # The caller cannot lower the cap at run time; make a bounded packet
+        # below instead of relying on an unbound argument.
+        assert "planner-bound effective cap" in str(error)
+    else:  # pragma: no cover
+        raise AssertionError("unbound cap override was accepted")
+
+    # Rebind with an effective cap below the observed 150 tokens; a rehashed
+    # packet alone could never accomplish this because its cap evidence binds
+    # the phase/prompt/runtime tuple.
+    cap_path = fixture["root"] / "low-cap.contract.json"
+    bounded = json.loads(
+        run_planner(
+            "bind",
+            "--plan", str(fixture["plan_path"]),
+            "--phase-key", fixture["phase"]["phase_key"],
+            "--prompt-file", str(fixture["prompt_path"]),
+            "--cwd", str(fixture["root"]),
+            "--sandbox", "read-only",
+            "--tool-mode", "none",
+            "--wall-time-seconds", "60",
+            "--token-cap", "149",
+            "--token-cap-contract-output", str(cap_path),
+        ).stdout
+    )
+    bounded_path = fixture["root"] / "low-cap.packet.json"
+    bounded_path.write_text(json.dumps(bounded), encoding="utf-8")
+    try:
+        DISPATCH.command_run(
+            run_args(
+                fixture,
+                dispatch_packet=bounded_path,
+                token_cap_contract=cap_path,
+            ),
+            CLI=FakeClaudeCLI,
+        )
+    except DISPATCH.DispatchError as error:
+        assert "observed cumulative usage exceeded" in str(error)
+        assert "typed control return" in str(error)
+    else:  # pragma: no cover
+        raise AssertionError("over-cap terminal stream was accepted")
+    receipt = DISPATCH.read_registry_receipts()[-1]
+    assert receipt["terminal_category"] == "BUDGET_STOP"
+    assert receipt["token_cap"] == 149
+
+    try:
+        DISPATCH.observed_cumulative_tokens({"usage": {"input_tokens": 100}})
+    except DISPATCH.DispatchError as error:
+        assert "output_tokens" in str(error)
+    else:  # pragma: no cover
+        raise AssertionError("partial usage was accepted")
+
+    FakeClaudeCLI.result_overrides = {"usage": {}}
+    try:
+        DISPATCH.command_run(run_args(fixture), CLI=FakeClaudeCLI)
+    except DISPATCH.DispatchError as error:
+        assert "cumulative usage" in str(error)
+        assert "typed control return" in str(error)
+    else:  # pragma: no cover
+        raise AssertionError("missing terminal usage was accepted")
+    receipt = DISPATCH.read_registry_receipts()[-1]
+    assert receipt["terminal_category"] == "MODEL_ENFORCEMENT_FAILURE"
+    assert receipt["status"] == "ABORTED"
+    control = json.loads(
+        (Path(receipt["stream_path"]).parent / "control-return.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert control["failure_class"] == "model_enforcement_failure"
+    reset_fake()
+
+
+def test_typed_control_return_preserves_legacy_reads_and_t4_pivots_are_read_only(
+    fixture: dict[str, Any],
+) -> None:
+    legacy_identity = {
+        "schema_version": 1,
+        "contract_name": DISPATCH.ADAPTIVE_CONTROL_RETURN_NAME,
+        "contract_version": 1,
+        "terminal_status": "ABORTED",
+        "terminal_category": "SETUP_FAILURE",
+        "recommended_action": "start_adaptive_workflow",
+        "control_state": "OUTSIDE_ADAPTIVE_MODEL_EXECUTION",
+        "allowed_parent_operations": ["t0_only"],
+        "prohibited_parent_operations": ["continue_cognitive_work_in_inherited_parent_model"],
+        "workflow_state": {
+            "plan_bound": False, "phase_key": None,
+            "resumable": False, "resume_checkpoint_present": False,
+        },
+    }
+    legacy = {**legacy_identity, "directive_sha256": DISPATCH.content_hash(legacy_identity)}
+    DISPATCH.validate_adaptive_control_return(legacy)
+    assert DISPATCH.pivot_from_receipt(legacy)["action"] == "t0_repair"
+
+    with tempfile.TemporaryDirectory(prefix="claude-v2-pivot-") as temporary:
+        root = Path(temporary)
+        for name in (
+            "input-manifest.json",
+            "prompt.txt",
+            "execution-metadata.json",
+            "execution-receipt.json",
+            "aborted.json",
+        ):
+            (root / name).write_text('{"status":"ABORTED"}\n', encoding="utf-8")
+        directive = DISPATCH.build_adaptive_control_return(
+            terminal_status="ABORTED", terminal_category="GROUNDED_COGNITIVE_FAILURE",
+            phase_key="coding:implement", root=root, cwd=fixture["root"], failed_tier="T3",
+            issues=["grounded fixture"],
+        )
+        DISPATCH.validate_adaptive_control_return(directive)
+        pivot = DISPATCH.pivot_from_receipt(directive)
+        packet = pivot["packet"]
+        assert packet["kind"] == "t4_consult"
+        assert packet["dispatch_permitted"] is True
+        assert packet["tier"] == "T4"
+        assert packet["sandbox"] == "read-only"
+        assert packet["network_access"] is False
+        assert packet["tool_mode"] == "none"
+        assert packet["mutation_authority"] is False
+        assert packet["limits"] == {
+            "token_cap": 16_000, "model_cycle_cap": 1,
+            "tool_cycle_cap": 0, "api_call_cap": 1, "wall_time_seconds": 300,
+        }
+        assert packet["repository_scope"] == {
+            "repository_path": str(fixture["root"].resolve()),
+            "path_scope": [str(fixture["root"].resolve())],
+            "source_commit": DISPATCH.source_commit_for(fixture["root"]),
+        }
+        assert len(directive["worktree_evidence"]["final"]["tool_visible_snapshot_sha256"]) == 64
+        DISPATCH.validate_pivot(pivot)
+        tampered = dict(pivot)
+        tampered_packet = dict(pivot["packet"])
+        tampered_packet["mutation_authority"] = True
+        tampered_packet["packet_sha256"] = DISPATCH.content_hash(
+            {key: value for key, value in tampered_packet.items() if key != "packet_sha256"}
+        )
+        tampered["packet"] = tampered_packet
+        tampered["pivot_sha256"] = DISPATCH.content_hash(
+            {key: value for key, value in tampered.items() if key != "pivot_sha256"}
+        )
+        try:
+            DISPATCH.validate_pivot(tampered)
+        except DISPATCH.DispatchError as error:
+            assert "T4 pivot cannot authorize mutation" in str(error)
+        else:
+            raise AssertionError("mutating T4 pivot was accepted")
+        marker = fixture["root"] / ".control-return-snapshot-tamper"
+        marker.write_text("changed\n", encoding="utf-8")
+        try:
+            DISPATCH.validate_control_return_evidence(directive)
+        except DISPATCH.DispatchError as error:
+            assert "tool-visible worktree snapshot changed" in str(error)
+        else:
+            raise AssertionError("changed tool-visible worktree was accepted")
+        finally:
+            marker.unlink()
+        (root / "aborted.json").write_text("{}\n", encoding="utf-8")
+        try:
+            DISPATCH.validate_control_return_evidence(directive)
+        except DISPATCH.DispatchError as error:
+            assert "hash changed" in str(error)
+        else:
+            raise AssertionError("changed terminal evidence was accepted")
 def test_packet_and_permission_drift_are_rejected(fixture: dict[str, Any]) -> None:
     reset_fake()
     for overrides, expected in (
@@ -635,6 +843,10 @@ def test_check_reports_router_admission_fields() -> None:
     assert report["evidence_grade"] == "declared"
     assert report["headless_efforts"] == ["low", "medium", "high"]
     assert report["in_session_tiers"] == ["T4"]
+    assert report["t4_execution_modes"] == {
+        "t4_consult": "UNAVAILABLE_CLAUDE_HEADLESS_ENFORCEMENT",
+        "t4_diagnose": "UNAVAILABLE_CLAUDE_HEADLESS_ENFORCEMENT",
+    }
     assert report["resumption"] == "ABORTED_NO_RESUMABLE_CHECKPOINT"
 
 
@@ -704,6 +916,8 @@ def main() -> int:
         test_run_retains_stream_extracts_metadata_and_chains_receipts(fixture)
         test_workspace_write_lane_can_verify_without_host_execution(fixture)
         test_terminal_result_is_mandatory(fixture)
+        test_cumulative_usage_cap_and_missing_usage_fail_closed(fixture)
+        test_typed_control_return_preserves_legacy_reads_and_t4_pivots_are_read_only(fixture)
         test_packet_and_permission_drift_are_rejected(fixture)
         test_install_journal_admission_blocks_executable_commands(root)
         test_wall_time_timeout_retains_partial_stream_and_aborted_receipt(fixture)

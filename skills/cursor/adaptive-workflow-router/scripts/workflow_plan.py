@@ -14,6 +14,20 @@ import sys
 from pathlib import Path
 from typing import Any
 
+from token_cap_contract import (
+    TOKEN_CAP_CONTRACT_NAME,
+    TOKEN_CAP_CONTRACT_VERSION,
+    TokenCapContractError,
+    build_token_cap_contract,
+    build_token_cap_evidence,
+    declared_token_budget,
+    effective_token_cap,
+    parse_phase_token_caps,
+    token_cap_binding,
+    token_cap_evidence_path,
+    validate_token_cap_contract,
+)
+
 
 SKILL_DIR = Path(__file__).resolve().parent.parent
 PLANNER_CONTRACT_VERSION = 1
@@ -161,6 +175,13 @@ RISK_TAGS = {
 }
 WORK_ID = re.compile(r"[a-z0-9][a-z0-9._-]{0,63}")
 UNVERSIONED_SOURCE_COMMIT = "0" * 40
+
+DEFAULT_DECLARED_TOKEN_CAP_BY_TIER = {
+    "T1": 8_000,
+    "T2": 16_000,
+    "T3": 32_000,
+    "T4": 64_000,
+}
 
 ORDERS = {
     "mutation": ["none", "reversible", "persistent", "irreversible"],
@@ -869,6 +890,12 @@ def build_plan(
     if not args.objective.strip():
         raise WorkflowError("objective must be non-empty")
     selected = select_workflows(catalog, args.application)
+    try:
+        explicit_phase_token_caps = parse_phase_token_caps(
+            getattr(args, "phase_token_cap", [])
+        )
+    except TokenCapContractError as error:
+        raise WorkflowError(str(error)) from error
     enabled = set(args.enable_condition)
     known_input_conditions = {
         phase["condition"]
@@ -956,6 +983,16 @@ def build_plan(
                 policy_ids.add(resolution["policy_id"])
                 record["route_request"] = request
                 record["route_resolution"] = resolution
+                if resolution.get("mode") == "model":
+                    try:
+                        record["token_budget"] = declared_token_budget(
+                            phase_key,
+                            resolution.get("tier"),
+                            DEFAULT_DECLARED_TOKEN_CAP_BY_TIER,
+                            explicit_phase_token_caps,
+                        )
+                    except TokenCapContractError as error:
+                        raise WorkflowError(str(error)) from error
                 source_has_gate = any(
                     candidate.get("execution") == "parent_gate"
                     and candidate.get("authority_for") == phase["id"]
@@ -999,6 +1036,14 @@ def build_plan(
             "router policy changed while the workflow plan was resolving"
         )
     policy_id = next(iter(policy_ids), None)
+    unknown_cap_phases = sorted(
+        set(explicit_phase_token_caps) - {record["phase_key"] for record in phases}
+    )
+    if unknown_cap_phases:
+        raise WorkflowError(
+            "phase-token-cap identifies no selected phase: "
+            + ", ".join(unknown_cap_phases)
+        )
     overrides = {
         "scope": args.scope,
         "ambiguity": args.ambiguity,
@@ -1194,6 +1239,18 @@ def select_dispatch_phase(
             not isinstance(item, str) or not item for item in phase[field]
         ):
             raise WorkflowError(f"dispatch phase has invalid {field}: {phase_key}")
+    token_budget = phase.get("token_budget")
+    if (
+        not isinstance(token_budget, dict)
+        or set(token_budget)
+        != {"schema_version", "declared_token_cap", "declaration_source"}
+        or token_budget.get("schema_version") != 1
+        or type(token_budget.get("declared_token_cap")) is not int
+        or token_budget["declared_token_cap"] < 1
+        or token_budget.get("declaration_source")
+        not in {"plan.phase-token-cap", "planner.route-default"}
+    ):
+        raise WorkflowError(f"dispatch phase has no valid declared token cap: {phase_key}")
     return phase
 
 
@@ -1232,6 +1289,7 @@ def phase_result_contract(phase: dict[str, Any]) -> dict[str, Any]:
         "exit_gate",
         "route_request",
         "route_resolution",
+        "token_budget",
     )
     return {field: phase.get(field) for field in fields}
 
@@ -1468,6 +1526,13 @@ def verify_plan_authority(
             visual_required=overrides["visual_required"],
             current_info_required=overrides["current_info_required"],
             external_action=overrides["external_action"],
+            phase_token_cap=[
+                f"{phase['phase_key']}={phase['token_budget']['declared_token_cap']}"
+                for phase in plan["phases"]
+                if isinstance(phase.get("token_budget"), dict)
+                and phase["token_budget"].get("declaration_source")
+                == "plan.phase-token-cap"
+            ],
         ),
     )
     regenerated = restore_legacy_router_health(regenerated, plan)
@@ -1544,6 +1609,7 @@ def phase_contract(phase: dict[str, Any]) -> dict[str, Any]:
         "exit_gate": phase["exit_gate"],
         "route_request": phase["route_request"],
         "route_resolution": phase["route_resolution"],
+        "token_budget": phase["token_budget"],
     }
 
 
@@ -1694,6 +1760,13 @@ def build_resume_contract(
         if any(value is not None for value in option_values):
             raise WorkflowError("resume options require --resumable")
         return None
+    # Cursor has no retained turn-control protocol or receipt-issuing driver
+    # that could make explicit-checkpoint-restart enforceable. Refuse instead
+    # of minting a planner contract that this platform cannot honor.
+    raise WorkflowError(
+        "resumable dispatch is unsupported on the Cursor surface: "
+        "ABORTED_NO_RESUMABLE_CHECKPOINT"
+    )
     if any(value is None for value in option_values):
         raise WorkflowError("--resumable requires every resume contract option")
     request = phase.get("route_request", {})
@@ -1836,18 +1909,40 @@ def load_required_skills(path: Path | None, cwd: Path) -> dict[str, Any]:
     }
 
 
+def write_json_artifact(path: Path, value: dict[str, Any], label: str) -> Path:
+    absolute = absolute_without_resolving(path)
+    if absolute.is_symlink():
+        raise WorkflowError(f"{label} output is unsafe: {absolute}")
+    parent = absolute.parent.resolve(strict=True)
+    target = parent / absolute.name
+    temporary = target.with_name(f".{target.name}.{content_hash(value)[:12]}.tmp")
+    if temporary.exists() or temporary.is_symlink():
+        raise WorkflowError(f"{label} temporary path is unsafe: {temporary}")
+    try:
+        temporary.write_text(
+            json.dumps(value, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+        )
+        os.replace(temporary, target)
+    except OSError:
+        if temporary.is_file() and not temporary.is_symlink():
+            temporary.unlink()
+        raise
+    return target
+
+
 def build_dispatch_packet(args: argparse.Namespace) -> dict[str, Any]:
     if args.wall_time_seconds < 1:
         raise WorkflowError("wall-time-seconds must be a positive integer")
     token_cap = getattr(args, "token_cap", None)
     token_cap_contract = getattr(args, "token_cap_contract", None)
+    token_cap_contract_output = getattr(args, "token_cap_contract_output", None)
     model_cycle_cap = getattr(args, "model_cycle_cap", None)
     tool_cycle_cap = getattr(args, "tool_cycle_cap", None)
     budget_increase_contract = getattr(args, "budget_increase_contract", None)
     if token_cap is not None and token_cap < 1:
         raise WorkflowError("token-cap must be a positive integer")
-    if token_cap_contract is not None and token_cap is None:
-        raise WorkflowError("token-cap-contract requires token-cap")
+    if token_cap_contract is not None and token_cap_contract_output is not None:
+        raise WorkflowError("choose token-cap-contract or token-cap-contract-output, not both")
     if model_cycle_cap is not None and model_cycle_cap < 1:
         raise WorkflowError("model-cycle-cap must be a positive integer")
     if tool_cycle_cap is not None and tool_cycle_cap < 0:
@@ -1883,6 +1978,31 @@ def build_dispatch_packet(args: argparse.Namespace) -> dict[str, Any]:
         del resolved
         return hashlib.sha256(raw).hexdigest()
 
+    declared = phase["token_budget"]["declared_token_cap"]
+    try:
+        effective = effective_token_cap(declared, declared, token_cap)
+    except TokenCapContractError as error:
+        raise WorkflowError(str(error)) from error
+    runtime_contract = {
+        "sandbox": args.sandbox,
+        "network_access": args.network_access,
+        "tool_mode": args.tool_mode,
+        "mutation_authorized": args.mutation_authorized,
+        "wall_time_seconds": args.wall_time_seconds,
+        "requested_budget_limits": {
+            "token_cap": effective,
+            "model_cycle_cap": model_cycle_cap,
+            "tool_cycle_cap": tool_cycle_cap,
+        },
+        "declared_token_cap": declared,
+        "derived_token_cap": declared,
+        "effective_token_cap": effective,
+        "caller_requested_token_cap": token_cap,
+        "token_cap_contract_sha256": None,
+        "token_cap_task_binding_sha256": None,
+        "dispatch_packet_binding_sha256": None,
+        "budget_increase_contract_sha256": optional_hash(budget_increase_contract),
+    }
     identity = {
         "schema_version": 2 if resume_contract is not None else 1,
         "planner_contract_version": plan["planner_contract_version"],
@@ -1894,28 +2014,58 @@ def build_dispatch_packet(args: argparse.Namespace) -> dict[str, Any]:
         "context_files": context_files,
         "context_bundle": context_bundle_record(context_files),
         "cwd": str(cwd),
-        "runtime_contract": {
-            "sandbox": args.sandbox,
-            "network_access": args.network_access,
-            "tool_mode": args.tool_mode,
-            "mutation_authorized": args.mutation_authorized,
-            "wall_time_seconds": args.wall_time_seconds,
-            "requested_budget_limits": {
-                "token_cap": token_cap,
-                "model_cycle_cap": model_cycle_cap,
-                "tool_cycle_cap": tool_cycle_cap,
-            },
-            "token_cap_contract_sha256": optional_hash(
-                token_cap_contract
-            ),
-            "budget_increase_contract_sha256": optional_hash(
-                budget_increase_contract
-            ),
-        },
+        "runtime_contract": runtime_contract,
         **skills,
     }
     if resume_contract is not None:
         identity["resume_contract"] = resume_contract
+    binding_hash = content_hash(identity)
+    runtime_contract["dispatch_packet_binding_sha256"] = binding_hash
+    binding = token_cap_binding(
+        plan_id=plan["plan_id"],
+        phase_key=phase["phase_key"],
+        phase_contract_sha256=identity["phase_contract_sha256"],
+        route_identity={"request": phase["route_request"], "resolution": phase["route_resolution"]},
+        prompt_sha256=identity["prompt_sha256"],
+        context_files=context_files,
+        context_bundle=identity["context_bundle"],
+        cwd=str(cwd),
+        source_commit=skills["source_commit"],
+        runtime_contract=runtime_contract,
+        dispatch_packet_binding_sha256=binding_hash,
+    )
+    binding_sha = content_hash(binding)
+    runtime_contract["token_cap_task_binding_sha256"] = binding_sha
+    if token_cap_contract_output is not None:
+        contract_path = absolute_without_resolving(token_cap_contract_output)
+        evidence_path = token_cap_evidence_path(contract_path)
+        contract, evidence = build_token_cap_contract(binding, runtime_contract, evidence_path)
+        write_json_artifact(evidence_path, evidence, "fixed token-cap evidence")
+        written = write_json_artifact(contract_path, contract, "fixed token-cap contract")
+        runtime_contract["token_cap_contract_sha256"] = hashlib.sha256(written.read_bytes()).hexdigest()
+    elif token_cap_contract is not None:
+        resolved, raw, contract = read_bound_json(token_cap_contract, "fixed token-cap contract")
+        evidence_value = contract.get("measured_safe_evidence_path")
+        if not isinstance(evidence_value, str) or not evidence_value:
+            raise WorkflowError("fixed token-cap evidence is missing or does not bind this task")
+        evidence_path = Path(evidence_value)
+        _, evidence_raw, evidence = read_bound_json(evidence_path, "fixed token-cap evidence")
+        try:
+            validate_token_cap_contract(
+                contract,
+                task_binding=binding,
+                runtime_contract=runtime_contract,
+                evidence=evidence,
+                evidence_raw_sha256=hashlib.sha256(evidence_raw).hexdigest(),
+            )
+        except TokenCapContractError as error:
+            raise WorkflowError(str(error)) from error
+        del raw
+        runtime_contract["token_cap_contract_sha256"] = hashlib.sha256(resolved.read_bytes()).hexdigest()
+    else:
+        raise WorkflowError(
+            "every routed model phase requires --token-cap-contract-output or --token-cap-contract"
+        )
     return {
         **identity,
         "dispatch_packet_sha256": content_hash(identity),
@@ -2001,6 +2151,13 @@ def build_parser() -> argparse.ArgumentParser:
     plan.add_argument("--current-info-required", action="store_true")
     plan.add_argument("--external-action", action="store_true")
     plan.add_argument(
+        "--phase-token-cap",
+        action="append",
+        default=[],
+        metavar="PHASE_KEY=CAP",
+        help="Structured declared ceiling for one model phase; never inferred from prose.",
+    )
+    plan.add_argument(
         "--output",
         type=Path,
         help="Atomically retain the generated dispatch plan at this path",
@@ -2023,6 +2180,11 @@ def build_parser() -> argparse.ArgumentParser:
     bind.add_argument("--wall-time-seconds", type=int, required=True)
     bind.add_argument("--token-cap", type=int)
     bind.add_argument("--token-cap-contract", type=Path)
+    bind.add_argument(
+        "--token-cap-contract-output",
+        type=Path,
+        help="Create the self-hashed task-bound fixed cap contract and evidence.",
+    )
     bind.add_argument("--model-cycle-cap", type=int)
     bind.add_argument("--tool-cycle-cap", type=int)
     bind.add_argument("--budget-increase-contract", type=Path)
