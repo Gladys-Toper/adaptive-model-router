@@ -4,8 +4,8 @@
     {
       "mode": "0o644",
       "path": "skills/claude/adaptive-model-router/SKILL.md",
-      "sha256": "743a8ac9b80d8a3c5387e93b504e71e78db0b583e964073716baa11619270be1",
-      "size": 13435
+      "sha256": "8f7df9fa2151d89e756ba1ae4556907f2cb4e9d65df57f6f758fc615678919f2",
+      "size": 16106
     },
     {
       "mode": "0o644",
@@ -76,8 +76,8 @@
     {
       "mode": "0o644",
       "path": "skills/claude/adaptive-workflow-router/SKILL.md",
-      "sha256": "5a889d0abdcb3b9ab2f6f7f88ed3bebe8bf435a9226c1c8e326393acf0a91cb8",
-      "size": 27400
+      "sha256": "8123b1b8ece0225b178b78f3e92a46371cf3d1e0a9dffeba7d44cd77b44222ff",
+      "size": 30561
     },
     {
       "mode": "0o644",
@@ -118,8 +118,8 @@
     {
       "mode": "0o644",
       "path": "skills/claude/adaptive-workflow-router/references/workflow-contract.md",
-      "sha256": "21b5dd5a48c7dc4e6738bf0995cbdde4d2b3f0386427b6d02d28f1c9406b009a",
-      "size": 25390
+      "sha256": "68f1560d6eaa3f3d616cb142416db3ead8fdcc1f73e070a145f6226aab0bde21",
+      "size": 28723
     },
     {
       "mode": "0o644",
@@ -132,6 +132,12 @@
       "path": "skills/claude/adaptive-workflow-router/scripts/deterministic_quality_grader.py",
       "sha256": "1a736960f8317d8988a2aba445a6960c8e3e3b2d094dbfd8bcac29f2c6ff8c86",
       "size": 3625
+    },
+    {
+      "mode": "0o644",
+      "path": "skills/claude/adaptive-workflow-router/scripts/failure_pivot_contract.py",
+      "sha256": "9235e00e55a92e7cd7e988dc9337fd483cb628a532a7a059d335381222f2c13b",
+      "size": 60456
     },
     {
       "mode": "0o644",
@@ -160,14 +166,20 @@
     {
       "mode": "0o644",
       "path": "skills/claude/adaptive-workflow-router/scripts/test_workflow_dispatch.py",
-      "sha256": "9680728a1c588ce89119e7403e65f82609edcaf0a405c5f929f952fe2167cc54",
-      "size": 26975
+      "sha256": "28d644f73162b45fc490a75f3c9fc320db2cdac75c23ed5393e2ebd1bcda6b9b",
+      "size": 36255
     },
     {
       "mode": "0o755",
       "path": "skills/claude/adaptive-workflow-router/scripts/test_workflow_plan.py",
-      "sha256": "b51f2334e4b87fe7ed0bc48329d8afc37684d5a304e1f0d58acf7598bba842d6",
-      "size": 33232
+      "sha256": "fca39296b4de3d8bc2ddd2c8759ae2e7c2f8b846af821fff86f3397be7835cd2",
+      "size": 39856
+    },
+    {
+      "mode": "0o644",
+      "path": "skills/claude/adaptive-workflow-router/scripts/token_cap_contract.py",
+      "sha256": "0bec37e5505027fc1e1b799b0c0fa1745599dfa06bec1a560ae474f9f8ca532f",
+      "size": 13332
     },
     {
       "mode": "0o644",
@@ -178,20 +190,20 @@
     {
       "mode": "0o644",
       "path": "skills/claude/adaptive-workflow-router/scripts/workflow_dispatch.py",
-      "sha256": "57f79a58488140cb00eff89c8f57464a787b1a04c090b2e9f42ce145bec4aff5",
-      "size": 46852
+      "sha256": "fa656c16cb541437be0d564a9eb8c65960b76d679e994836965e304dda4c45e8",
+      "size": 65911
     },
     {
       "mode": "0o755",
       "path": "skills/claude/adaptive-workflow-router/scripts/workflow_plan.py",
-      "sha256": "b25edeeb5a781e6a045d1e4e138617d732e581276bfa850c5eec762c520ddedb",
-      "size": 86952
+      "sha256": "539d9622b27ee183e3cbcd1eebf0d40ef0c220ede17f31632717c99afb7573ce",
+      "size": 94674
     },
     {
       "mode": "0o644",
       "path": "skills/codex/adaptive-model-router/SKILL.md",
-      "sha256": "3956d4edb5cb4ca4c3bfa6043d355893a67f09f3400019cc1bcd920d51bc18aa",
-      "size": 18230
+      "sha256": "e8bbf48b5e7cb4216f251c7859e27c4673fbac00fdd9fe1e7ab86bfe369c2b97",
+      "size": 21523
     },
     {
       "mode": "0o644",
@@ -262,8 +274,8 @@
     {
       "mode": "0o644",
       "path": "skills/codex/adaptive-workflow-router/SKILL.md",
-      "sha256": "3914a51814b1566d4dd2f0d866b6fa65a68dba306fc652d370326e3ca92b6aee",
-      "size": 27351
+      "sha256": "6c0f82960b8804f5da4df5a858166e67264afb3b0954cbb5c5d8ddea02a47663",
+      "size": 34334
     },
     {
       "mode": "0o644",
@@ -316,8 +328,8 @@
     {
       "mode": "0o644",
       "path": "skills/codex/adaptive-workflow-router/references/workflow-contract.md",
-      "sha256": "b7ef56b5234920fca30d600ccea7c497906813d786e2eb632b92715aa1bb70f4",
-      "size": 26412
+      "sha256": "50f4e4c95d91c62dee59ef2d74407f21c42678eedfad126692c3b78c7549fbb8",
+      "size": 33294
     },
     {
       "mode": "0o644",
@@ -330,6 +342,12 @@
       "path": "skills/codex/adaptive-workflow-router/scripts/deterministic_quality_grader.py",
       "sha256": "1a736960f8317d8988a2aba445a6960c8e3e3b2d094dbfd8bcac29f2c6ff8c86",
       "size": 3625
+    },
+    {
+      "mode": "0o644",
+      "path": "skills/codex/adaptive-workflow-router/scripts/failure_pivot_contract.py",
+      "sha256": "9235e00e55a92e7cd7e988dc9337fd483cb628a532a7a059d335381222f2c13b",
+      "size": 60456
     },
     {
       "mode": "0o644",
@@ -364,14 +382,20 @@
     {
       "mode": "0o755",
       "path": "skills/codex/adaptive-workflow-router/scripts/test_workflow_dispatch.py",
-      "sha256": "7bd746f97d1f15a77fb9c458a067bd310aeb7e96e34912b34df68c21a1cd80d4",
-      "size": 175462
+      "sha256": "79e318eb1c6ff7af0143e6a32888dfc6e9214479bbea30905559b434e6885973",
+      "size": 220944
     },
     {
       "mode": "0o755",
       "path": "skills/codex/adaptive-workflow-router/scripts/test_workflow_plan.py",
-      "sha256": "2153812012f09dbc5190a56c2b4f35fa8bc747146a99645c6b04adf575648af5",
-      "size": 34376
+      "sha256": "9b3e5135f29b3fccf1eb1894e59a611136fd4347ee79fd3fbfe9b44b6f181527",
+      "size": 46474
+    },
+    {
+      "mode": "0o644",
+      "path": "skills/codex/adaptive-workflow-router/scripts/token_cap_contract.py",
+      "sha256": "0bec37e5505027fc1e1b799b0c0fa1745599dfa06bec1a560ae474f9f8ca532f",
+      "size": 13332
     },
     {
       "mode": "0o644",
@@ -382,20 +406,20 @@
     {
       "mode": "0o755",
       "path": "skills/codex/adaptive-workflow-router/scripts/workflow_dispatch.py",
-      "sha256": "8291f2a8952f2803cab8113721e2a0929c13b9aa079dfcd30ffda0c1b83435ba",
-      "size": 296127
+      "sha256": "669667812a4c22e50ee4785e9339c9dc8c2745011c63565e050d9a4a79765dd8",
+      "size": 361629
     },
     {
       "mode": "0o755",
       "path": "skills/codex/adaptive-workflow-router/scripts/workflow_plan.py",
-      "sha256": "028e2bf179b7fa2dd89a50db9075484a5c09ee983703b21ba13c044a525c1178",
-      "size": 86581
+      "sha256": "532f7a076cd0946a29adf5e5a878dab0ca302896e4f7534b793fc6a9ddc39172",
+      "size": 104550
     },
     {
       "mode": "0o644",
       "path": "skills/cursor/adaptive-model-router/SKILL.md",
-      "sha256": "98edc6655fd31dd57c527aaa267fa403c8eb70f262073c18a288865eed5a5f04",
-      "size": 6099
+      "sha256": "eae75adebd01dc29e12a821f06ccbebaea56477c394596ba4580bafc7ca0e5bd",
+      "size": 8972
     },
     {
       "mode": "0o644",
@@ -436,8 +460,8 @@
     {
       "mode": "0o644",
       "path": "skills/cursor/adaptive-workflow-router/SKILL.md",
-      "sha256": "efc1ef93e88eafd3804573a1513c7ff271f175cc31af574526395cf5eb62026a",
-      "size": 3757
+      "sha256": "d69209e7b66994e6f884cd66cd7386b68d2cc10f63bb39acf9b52214b6c007df",
+      "size": 6669
     },
     {
       "mode": "0o644",
@@ -454,24 +478,36 @@
     {
       "mode": "0o644",
       "path": "skills/cursor/adaptive-workflow-router/references/workflow-contract.md",
-      "sha256": "74b172412d0fdd3972c5adc0d2df03e8cb66951b51149e3f5962750f39fa5ce3",
-      "size": 3956
+      "sha256": "a293ea33af1534e4b1bf79e3db9e2637db63593bac99f33db905036d69c2bc17",
+      "size": 5193
+    },
+    {
+      "mode": "0o644",
+      "path": "skills/cursor/adaptive-workflow-router/scripts/failure_pivot_contract.py",
+      "sha256": "9235e00e55a92e7cd7e988dc9337fd483cb628a532a7a059d335381222f2c13b",
+      "size": 60456
     },
     {
       "mode": "0o755",
       "path": "skills/cursor/adaptive-workflow-router/scripts/test_workflow_plan.py",
-      "sha256": "822400c89ee70761b07a556a67e1c565bb9324a487f6b428ab2aa6025b44f1a3",
-      "size": 34817
+      "sha256": "875a6ebfe3820b3331311bddb584358ee6d9c2fb1dc20391dae8268a98921aee",
+      "size": 37990
+    },
+    {
+      "mode": "0o644",
+      "path": "skills/cursor/adaptive-workflow-router/scripts/token_cap_contract.py",
+      "sha256": "0bec37e5505027fc1e1b799b0c0fa1745599dfa06bec1a560ae474f9f8ca532f",
+      "size": 13332
     },
     {
       "mode": "0o755",
       "path": "skills/cursor/adaptive-workflow-router/scripts/workflow_plan.py",
-      "sha256": "028e2bf179b7fa2dd89a50db9075484a5c09ee983703b21ba13c044a525c1178",
-      "size": 86581
+      "sha256": "15e557b52dba27217b91f41f71548218830728daaff6ced148e276d0ef65957b",
+      "size": 93747
     }
   ],
-  "generated_at": "2026-08-17T19:58:05Z",
-  "harness_source_commit": "44499d950ae5d08b7da26e902592b9b35698b181",
+  "generated_at": "2026-08-26T21:12:11Z",
+  "harness_source_commit": "76adab7e3ddabfff509437c5fd1fa2e573a677b4",
   "harness_worktree_dirty": false,
   "published_trees": [
     "skills/codex/adaptive-model-router",

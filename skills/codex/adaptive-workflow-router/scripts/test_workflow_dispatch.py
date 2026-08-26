@@ -1723,6 +1723,8 @@ def test_parallel_capacity_branch_binds_route_and_resource_envelope() -> None:
                 "-C",
                 str(root),
                 "-c",
+                "commit.gpgSign=false",
+                "-c",
                 "user.name=Harness Test",
                 "-c",
                 "user.email=harness@example.invalid",
@@ -1904,6 +1906,8 @@ def test_capacity_workspace_enforces_declared_hierarchical_scope() -> None:
                 "-C",
                 str(root),
                 "-c",
+                "commit.gpgSign=false",
+                "-c",
                 "user.name=Harness Test",
                 "-c",
                 "user.email=harness@example.invalid",
@@ -1944,6 +1948,8 @@ def test_capacity_workspace_enforces_declared_hierarchical_scope() -> None:
                 "git",
                 "-C",
                 str(root),
+                "-c",
+                "commit.gpgSign=false",
                 "-c",
                 "user.name=Harness Test",
                 "-c",
@@ -2320,6 +2326,7 @@ def test_planner_dispatch_packet_binds_exact_inputs() -> None:
         "exit_gate": ["evidence retained"],
         "route_request": {"activity": "inspect"},
         "route_resolution": {"tier": "T1"},
+        "token_budget": {"schema_version": 1, "declared_token_cap": 8_000, "declaration_source": "planner.route-default"},
     }
     binding = {
         "planner_contract_version": 1,
@@ -2334,28 +2341,169 @@ def test_planner_dispatch_packet_binds_exact_inputs() -> None:
         tool_mode="none",
         mutation_authorized=False,
         wall_time_seconds=60,
+        token_cap=8_000,
+        token_cap_contract=None,
+        budget_increase_contract=None,
     )
-    packet = DISPATCH.expected_dispatch_packet(
-        binding,
-        prompt_sha256="c" * 64,
-        context_records=[],
-        cwd=Path("/tmp"),
-        args=args,
-    )
+    with tempfile.TemporaryDirectory(prefix="workflow-packet-cap-") as temporary:
+        evidence = Path(temporary) / "evidence.json"
+        contract = Path(temporary) / "contract.json"
+        evidence.write_text('{"fixture":true}\n', encoding="utf-8")
+        contract.write_text("{}\n", encoding="utf-8")
+        args.token_cap_contract = contract
+        DISPATCH.expected_dispatch_packet(binding, prompt_sha256="c" * 64, context_records=[], cwd=Path("/tmp"), args=args)
+        identity = {
+            "schema_version": 1, "contract_name": DISPATCH.TOKEN_CAP_CONTRACT_NAME,
+            "contract_version": 1, "task_binding_sha256": DISPATCH.content_hash(args._token_cap_task_binding),
+            "token_cap": 8_000, "measured_safe_evidence_path": str(evidence),
+            "measured_safe_evidence_sha256": DISPATCH.sha256_bytes(evidence.read_bytes()), "rationale": "fixed fixture",
+        }
+        DISPATCH.write_json(contract, {**identity, "contract_sha256": DISPATCH.content_hash(identity)})
+        packet = DISPATCH.expected_dispatch_packet(
+            binding, prompt_sha256="c" * 64, context_records=[], cwd=Path("/tmp"), args=args,
+        )
+        args._caller_token_cap = None
+        packet_without_caller_cap = DISPATCH.expected_dispatch_packet(
+            binding, prompt_sha256="c" * 64, context_records=[], cwd=Path("/tmp"), args=args,
+        )
+        assert packet_without_caller_cap["runtime_contract"]["caller_requested_token_cap"] is None
+        changed = DISPATCH.expected_dispatch_packet(
+            binding, prompt_sha256="d" * 64, context_records=[], cwd=Path("/tmp"), args=args,
+        )
     DISPATCH.validate_dispatch_packet(packet, packet)
-    changed = DISPATCH.expected_dispatch_packet(
-        binding,
-        prompt_sha256="d" * 64,
-        context_records=[],
-        cwd=Path("/tmp"),
-        args=args,
-    )
     try:
         DISPATCH.validate_dispatch_packet(packet, changed)
     except DISPATCH.DispatchError:
         pass
     else:
         raise AssertionError("dispatch packet accepted a changed prompt")
+
+
+def test_planned_run_accepts_bound_cap_without_caller_cap_and_rebuilds_scope() -> None:
+    """The bound packet supplies the effective cap; caller intent stays null."""
+    parser = DISPATCH.build_parser()
+    original_argv = sys.argv
+    try:
+        sys.argv = [
+            "workflow_dispatch.py", "run", "--plan", "/plan.json", "--phase-key", "coding:write",
+            "--dispatch-packet", "/packet.json", "--prompt-file", "/prompt.txt", "--cwd", "/cwd",
+            "--token-cap-contract", "/cap.json",
+        ]
+        parsed = parser.parse_args()
+        assert parsed.token_cap is None and parsed.token_cap_contract == Path("/cap.json")
+    finally:
+        sys.argv = original_argv
+    with tempfile.TemporaryDirectory(prefix="workflow-packet-scope-") as temporary:
+        cwd = Path(temporary)
+        (cwd / "allowed").mkdir()
+        (cwd / "other").mkdir()
+        args = argparse.Namespace(
+            sandbox="workspace-write", network_access=False, tool_mode="default",
+            mutation_authorized=True, planner_authorized_mutation_scope=["allowed"],
+            wall_time_seconds=60, token_cap=200, token_cap_contract=None,
+            budget_increase_contract=None,
+        )
+        binding = {
+            "planner_contract_version": 1, "plan_id": "a" * 64,
+            "plan_policy_id": "b" * 64, "phase_key": "coding:write",
+            "phase": {
+                "phase_key": "coding:write", "workflow_id": "coding", "workflow_version": 1,
+                "phase_id": "write", "pattern": "chain", "produces": ["changed"],
+                "exit_gate": ["checked"], "route_request": {"activity": "write"},
+                "route_resolution": {"tier": "T3"},
+                "token_budget": {"schema_version": 1, "declared_token_cap": 200},
+            },
+        }
+        packet = DISPATCH.expected_dispatch_packet(
+            binding, prompt_sha256="c" * 64, context_records=[], cwd=cwd, args=args,
+        )
+        args.planner_authorized_mutation_scope = ["other"]
+        changed = DISPATCH.expected_dispatch_packet(
+            binding, prompt_sha256="c" * 64, context_records=[], cwd=cwd, args=args,
+        )
+        try:
+            DISPATCH.validate_dispatch_packet(packet, changed)
+        except DISPATCH.DispatchError:
+            pass
+        else:
+            raise AssertionError("dispatch packet accepted a changed writable scope")
+
+
+def test_health_packet_args_bind_planner_cap_and_exact_scope() -> None:
+    phase = {
+        "phase_key": "coding.change:implement",
+        "workflow_id": "coding.change",
+        "workflow_version": 1,
+        "phase_id": "implement",
+        "pattern": "chain",
+        "produces": ["changed"],
+        "exit_gate": ["checked"],
+        "route_request": {"activity": "implement", "mutation": "reversible"},
+        "route_resolution": {"tier": "T3"},
+        "token_budget": {
+            "schema_version": 1,
+            "declared_token_cap": 16_000,
+            "declaration_source": "planner.route-default",
+        },
+    }
+    binding = {
+        "planner_contract_version": 1,
+        "plan_id": "a" * 64,
+        "plan_policy_id": "b" * 64,
+        "phase_key": phase["phase_key"],
+        "phase": phase,
+    }
+    args = DISPATCH.health_packet_args(
+        phase,
+        sandbox="workspace-write",
+        network_access=False,
+        tool_mode="default",
+        mutation_authorized=True,
+    )
+    packet = DISPATCH.expected_dispatch_packet(
+        binding,
+        prompt_sha256="c" * 64,
+        context_records=[],
+        cwd=DISPATCH.SKILL_DIR,
+        args=args,
+    )
+    runtime = packet["runtime_contract"]
+    assert runtime["declared_token_cap"] == 16_000
+    assert runtime["effective_token_cap"] == 16_000
+    assert runtime["caller_requested_token_cap"] is None
+    assert runtime["planner_authorized_mutation_scope"] == [
+        "scripts/workflow_dispatch.py"
+    ]
+
+    read_only_phase = {
+        **phase,
+        "phase_key": "coding.change:inspect",
+        "phase_id": "inspect",
+        "route_request": {"activity": "inspect", "mutation": "none"},
+        "route_resolution": {"tier": "T1"},
+    }
+    read_only = DISPATCH.health_packet_args(
+        read_only_phase,
+        sandbox="read-only",
+        network_access=False,
+        tool_mode="none",
+        mutation_authorized=False,
+    )
+    assert read_only.token_cap == 16_000
+    assert read_only._caller_token_cap is None
+    assert read_only.planner_authorized_mutation_scope == []
+    try:
+        DISPATCH.health_packet_args(
+            phase,
+            sandbox="read-only",
+            network_access=False,
+            tool_mode="none",
+            mutation_authorized=False,
+        )
+    except DISPATCH.DispatchError as error:
+        assert "mutation authority differs" in str(error)
+    else:
+        raise AssertionError("health packet accepted mismatched mutation authority")
 
 
 def workflow_plan(activation: str = "active") -> dict:
@@ -2601,7 +2749,7 @@ def test_adaptive_control_return_is_private_self_hashed_and_strict() -> None:
         phase_key="coding:inspect",
     )
     DISPATCH.validate_adaptive_control_return(directive)
-    assert directive["recommended_action"] == "t0_only"
+    assert directive["recommended_action"] == "abort"
     assert directive["control_state"] == "OUTSIDE_ADAPTIVE_MODEL_EXECUTION"
     tampered = dict(directive)
     tampered["recommended_action"] = "start_adaptive_workflow"
@@ -2668,7 +2816,7 @@ def test_adaptive_control_return_finalizes_success_and_setup_failure_once() -> N
             ).read_text(encoding="utf-8")
         )
         assert failure["terminal_category"] == "USAGE_ERROR"
-        assert failure["recommended_action"] == "start_adaptive_workflow"
+        assert failure["recommended_action"] == "t0_repair"
 
 
 def test_adaptive_control_return_marker_is_final_and_exactly_once() -> None:
@@ -2708,7 +2856,7 @@ def test_adaptive_control_return_abort_precedes_completed_metadata() -> None:
         DISPATCH.validate_adaptive_control_return(directive)
         assert directive["terminal_status"] == "ABORTED"
         assert directive["terminal_category"] == "BUDGET_STOP"
-        assert directive["recommended_action"] == "start_adaptive_workflow"
+        assert directive["recommended_action"] == "partition"
 
 
 def test_adaptive_control_return_rejects_budget_and_runtime_outcomes() -> None:
@@ -2724,7 +2872,9 @@ def test_adaptive_control_return_rejects_budget_and_runtime_outcomes() -> None:
             )
             assert directive is not None
             DISPATCH.validate_adaptive_control_return(directive)
-            assert directive["recommended_action"] == "start_adaptive_workflow"
+            assert directive["recommended_action"] == (
+                "partition" if category == "BUDGET_STOP" else "abort"
+            )
 
 
 def test_parent_authority_control_return_propagates_category() -> None:
@@ -2741,7 +2891,7 @@ def test_parent_authority_control_return_propagates_category() -> None:
         directive = args._adaptive_control_return
         DISPATCH.validate_adaptive_control_return(directive)
         assert directive["terminal_category"] == "PARENT_GATE_REQUIRED"
-        assert directive["recommended_action"] == "ask_or_advise_user"
+        assert directive["recommended_action"] == "ask_user"
 
 
 def test_smoke_emits_one_final_propagated_control_return_marker() -> None:
@@ -2846,7 +2996,7 @@ def test_main_control_return_terminal_paths() -> None:
                 completed_root / "control-return" / "adaptive-control-return.json"
             ).read_text(encoding="utf-8")
         )
-        assert completed["recommended_action"] == "t0_only"
+        assert completed["recommended_action"] == "abort"
 
         usage_root = root / "usage"
         usage_root.mkdir()
@@ -2868,7 +3018,7 @@ def test_main_control_return_terminal_paths() -> None:
             )
         )
         assert usage["terminal_category"] == "USAGE_ERROR"
-        assert usage["recommended_action"] == "start_adaptive_workflow"
+        assert usage["recommended_action"] == "t0_repair"
 
         setup_root = root / "setup"
         setup_root.mkdir()
@@ -2895,7 +3045,7 @@ def test_main_control_return_terminal_paths() -> None:
             ).read_text(encoding="utf-8")
         )
         assert setup["terminal_category"] == "SETUP_FAILURE"
-        assert setup["recommended_action"] == "start_adaptive_workflow"
+        assert setup["recommended_action"] == "t0_repair"
 
         authority_root = root / "authority"
         authority_root.mkdir()
@@ -2917,7 +3067,7 @@ def test_main_control_return_terminal_paths() -> None:
             ).read_text(encoding="utf-8")
         )
         assert authority["terminal_category"] == "PARENT_GATE_REQUIRED"
-        assert authority["recommended_action"] == "ask_or_advise_user"
+        assert authority["recommended_action"] == "ask_user"
 
         for category in ("BUDGET_STOP", "MODEL_OR_RUNTIME_REJECTION"):
             rejected_root = root / category
@@ -2954,7 +3104,9 @@ def test_main_control_return_terminal_paths() -> None:
                     / "adaptive-control-return.json"
                 ).read_text(encoding="utf-8")
             )
-            assert rejected["recommended_action"] == "start_adaptive_workflow"
+            assert rejected["recommended_action"] == (
+                "partition" if category == "BUDGET_STOP" else "abort"
+            )
 
         resume_root = root / "resume"
         checkpoint = resume_root / "checkpoint.json"
@@ -3096,7 +3248,7 @@ def test_resume_exception_finalizes_canonical_abort_and_control_return() -> None
         )
         DISPATCH.validate_adaptive_control_return(authority_directive)
         assert authority_directive["terminal_category"] == "PARENT_GATE_REQUIRED"
-        assert authority_directive["recommended_action"] == "ask_or_advise_user"
+        assert authority_directive["recommended_action"] == "ask_user"
 
 
 def test_aborted_json_output_precedes_final_control_return_marker() -> None:
@@ -3339,8 +3491,79 @@ def test_run_phase_registers_only_clean_completed_provenance() -> None:
                     == 2
                 )
                 FakeAppServer.extra_usage_update = False
+                # Plan -> bind -> run with the real fixed v2 cap contract.
+                # The CLI has no caller cap; the sealed packet provides 20k.
+                planned_phase = {
+                    "phase_key": "coding:inspect",
+                    "workflow_id": "coding",
+                    "workflow_version": 1,
+                    "phase_id": "inspect",
+                    "pattern": "chain",
+                    "produces": ["inspection"],
+                    "exit_gate": ["inspection is explicit"],
+                    "route_request": request,
+                    "route_resolution": resolution,
+                    "token_budget": {"schema_version": 1, "declared_token_cap": 20_000},
+                }
+                plan_binding = {
+                    "planner_contract_version": 1,
+                    "plan_id": "d" * 64,
+                    "plan_policy_id": resolution["policy_id"],
+                    "phase_key": planned_phase["phase_key"],
+                    "phase": planned_phase,
+                    "planned_resolution": resolution,
+                }
+                cap_dir = root / "planned-cap"; cap_dir.mkdir()
+                cap_path = cap_dir / "cap.json"
+                bind_args = arguments(root / "planned-bind", "done")
+                bind_args.token_cap = 20_000
+                bind_args._caller_token_cap = None
+                bind_args.planner_authorized_mutation_scope = []
+                bind_args._skill_requirements = {
+                    "required_skills": [], "skill_hashes": {}, "source_commit": "a" * 40,
+                }
+                prospective = DISPATCH.expected_dispatch_packet(
+                    plan_binding,
+                    prompt_sha256=DISPATCH.sha256_bytes(prompt.read_bytes()),
+                    context_records=[], cwd=root.resolve(), args=bind_args,
+                )
+                evidence_path = DISPATCH.token_caps.token_cap_evidence_path(cap_path)
+                contract, evidence = DISPATCH.token_caps.build_token_cap_contract(
+                    bind_args._token_cap_task_binding,
+                    prospective["runtime_contract"],
+                    evidence_path,
+                )
+                DISPATCH.write_json(evidence_path, evidence)
+                DISPATCH.write_json(cap_path, contract)
+                bind_args.token_cap_contract = cap_path
+                packet = DISPATCH.expected_dispatch_packet(
+                    plan_binding,
+                    prompt_sha256=DISPATCH.sha256_bytes(prompt.read_bytes()),
+                    context_records=[], cwd=root.resolve(), args=bind_args,
+                )
+                plan_binding["dispatch_packet"] = packet
+                planned = arguments(root / "planned-run", "done")
+                planned.plan = root / "plan.json"
+                planned.phase_key = planned_phase["phase_key"]
+                planned.dispatch_packet = root / "packet.json"
+                planned.token_cap = None
+                planned.token_cap_contract = cap_path
+                planned.planner_authorized_mutation_scope = []
+                planned._skill_requirements = bind_args._skill_requirements
+                with patched_dispatch(
+                    load_route=lambda unused_args: (request, plan_binding),
+                    require_authoritative_source_commit=lambda unused_cwd: "a" * 40,
+                    source_commit_for=lambda unused_cwd: "a" * 40,
+                ):
+                    planned_result = DISPATCH.run_phase(planned)
+                assert planned_result == 0, json.dumps(
+                    json.loads((root / "planned-run" / "aborted.json").read_text(encoding="utf-8")),
+                    sort_keys=True,
+                )
+                assert planned._caller_token_cap is None
+                assert planned.token_cap == 20_000
             receipts = DISPATCH._decode_receipt_registry(registry.read_bytes())
-            assert len(receipts) == 1
+            assert len(receipts) == 2
             assert receipts[0]["status"] == "COMPLETED"
             assert receipts[0]["issues"] == []
             assert clean_arguments._dispatcher_receipt == receipts[0]
@@ -3370,6 +3593,8 @@ def test_checkpoint_restart_uses_fresh_turn_and_only_unfinished_work() -> None:
                 "git",
                 "-C",
                 str(base),
+                "-c",
+                "commit.gpgSign=false",
                 "-c",
                 "user.name=Harness Test",
                 "-c",
@@ -4325,6 +4550,660 @@ def test_blind_quality_is_bound_to_registered_grader_output() -> None:
             ]
 
 
+def legacy_control_return(status: str, category: str | None) -> dict[str, Any]:
+    value = {
+        "schema_version": 1,
+        "contract_name": DISPATCH.ADAPTIVE_CONTROL_RETURN_NAME,
+        "contract_version": 1,
+        "terminal_status": status,
+        "terminal_category": category,
+        "recommended_action": DISPATCH._control_return_recommendation(status, category),
+        "control_state": "OUTSIDE_ADAPTIVE_MODEL_EXECUTION",
+        "allowed_parent_operations": ["t0_only", "ask_or_advise_user", "start_adaptive_workflow"],
+        "prohibited_parent_operations": ["continue_cognitive_work_in_inherited_parent_model"],
+        "workflow_state": {"plan_bound": False, "phase_key": None, "resumable": False, "resume_checkpoint_present": False},
+    }
+    return {**value, "directive_sha256": DISPATCH.content_hash(value)}
+
+
+def typed_control_return(root: Path, category: str, *, tier: str = "T1", resumable: bool = False) -> dict[str, Any]:
+    DISPATCH.write_json(root / "aborted.json", {"schema_version": 1, "status": "ABORTED", "category": category, "issues": ["grounded fixture"]})
+    return DISPATCH.build_adaptive_control_return(
+        terminal_status="ABORTED", terminal_category=category, phase_key="coding:implement",
+        root=root, cwd=root, resumable=resumable, failed_tier=tier,
+    )
+
+
+def complete_typed_control_return(root: Path, category: str, *, tier: str = "T3") -> dict[str, Any]:
+    """Build a complete immutable evidence packet without invoking a model."""
+    root.mkdir(parents=True, exist_ok=True)
+    DISPATCH.write_json(root / "input-manifest.json", {"fixture": "input"})
+    (root / "prompt.txt").write_text("fixture prompt\n", encoding="utf-8")
+    DISPATCH.write_json(root / "execution-metadata.json", {"fixture": "metadata"})
+    DISPATCH.write_json(root / "execution-receipt.json", {"fixture": "receipt"})
+    DISPATCH.write_json(root / "aborted.json", {"fixture": "failure", "status": "ABORTED", "category": category})
+    refs, _ = DISPATCH._terminal_evidence(root)
+    snapshot = {
+        "source_commit": "a" * 40,
+        "worktree": str(root.resolve()),
+        "status": "clean",
+        "tracked_diff_sha256": "b" * 64,
+        "tool_visible_snapshot_sha256": "c" * 64,
+    }
+    return DISPATCH.failure_pivot.build_control_return(
+        terminal_status="ABORTED", terminal_category=category,
+        phase_key="coding:implement", resumable=False,
+        resume_checkpoint_present=False, evidence_references=refs,
+        failed_tier=tier,
+        worktree_evidence={
+            "admission": snapshot,
+            "final": snapshot,
+            "allowed_mutation_scope": "workspace-write",
+        },
+    )
+
+
+def test_v1_control_return_remains_valid_and_v2_evidence_is_tamper_evident() -> None:
+    DISPATCH.validate_adaptive_control_return(legacy_control_return("ABORTED", "SETUP_FAILURE"))
+    with tempfile.TemporaryDirectory(prefix="workflow-v2-control-") as temporary:
+        root = Path(temporary)
+        directive = typed_control_return(root, "BUDGET_STOP")
+        DISPATCH.validate_adaptive_control_return(directive)
+        changed = dict(directive)
+        changed["recommended_action"] = "escalate"
+        try:
+            DISPATCH.validate_adaptive_control_return(changed)
+        except DISPATCH.DispatchError:
+            pass
+        else:
+            raise AssertionError("tampered v2 control return was accepted")
+        (root / "aborted.json").write_text("{}\n", encoding="utf-8")
+        try:
+            DISPATCH.validate_control_return_evidence(directive)
+        except DISPATCH.DispatchError as error:
+            assert "hash changed" in str(error)
+        else:
+            raise AssertionError("changed terminal evidence was accepted")
+
+
+def test_pivot_state_machine_is_exact_idempotent_and_t4_is_read_only() -> None:
+    with tempfile.TemporaryDirectory(prefix="workflow-pivot-") as temporary:
+        root = Path(temporary)
+        setup = typed_control_return(root, "USAGE_ERROR")
+        first = DISPATCH.pivot_from_receipt(setup)
+        assert first["action"] == "t0_repair" and first["packet"]["repair_only"] is True
+        # The same receipt has one byte-stable pivot.  A result file is a cache,
+        # never retry lineage; feeding it back as lineage must fail closed.
+        assert DISPATCH.pivot_from_receipt(setup) == first
+        try:
+            DISPATCH.pivot_from_receipt(setup, previous_pivot=first)
+        except DISPATCH.DispatchError as error:
+            assert "same-receipt" in str(error)
+        else:
+            raise AssertionError("same-receipt pivot was accepted as prior lineage")
+        later_root = root / "later-setup"; later_root.mkdir()
+        later_setup = typed_control_return(later_root, "USAGE_ERROR")
+        try:
+            DISPATCH.pivot_from_receipt(later_setup, previous_pivot=first)
+        except DISPATCH.DispatchError as error:
+            assert "lineage" in str(error)
+        else:
+            raise AssertionError("foreign same-phase pivot advanced retry lineage")
+        transient = typed_control_return(root, "TRANSIENT_FAILURE")
+        retry = DISPATCH.pivot_from_receipt(transient)
+        assert retry["action"] == "retry_same_route"
+        later_transient_root = root / "later-transient"; later_transient_root.mkdir()
+        later_transient = typed_control_return(later_transient_root, "TRANSIENT_FAILURE")
+        try:
+            DISPATCH.pivot_from_receipt(later_transient, previous_pivot=retry)
+        except DISPATCH.DispatchError as error:
+            assert "lineage" in str(error)
+        else:
+            raise AssertionError("foreign transient pivot advanced retry lineage")
+        (root / "resume-checkpoint.0001.json").write_text('{"fixture":true}\n', encoding="utf-8")
+        resumable_transient = typed_control_return(root, "TRANSIENT_FAILURE", resumable=True)
+        assert DISPATCH.pivot_from_receipt(resumable_transient)["action"] == "resume"
+        grounded = typed_control_return(root, "GROUNDED_COGNITIVE_FAILURE", tier="T1")
+        assert DISPATCH.pivot_from_receipt(grounded)["packet"]["kind"] == "t4_diagnose"
+        t3 = complete_typed_control_return(root / "complete", "GROUNDED_COGNITIVE_FAILURE", tier="T3")
+        consultation = DISPATCH.pivot_from_receipt(t3)
+        assert consultation["packet"]["kind"] == "t4_consult"
+        assert consultation["packet"]["tool_mode"] == "none"
+        DISPATCH.validate_pivot(consultation)
+        bad = json.loads(json.dumps(consultation))
+        bad["packet"]["mutation_authority"] = True
+        bad["pivot_sha256"] = DISPATCH.content_hash({key: value for key, value in bad.items() if key != "pivot_sha256"})
+        try:
+            DISPATCH.validate_pivot(bad)
+        except DISPATCH.DispatchError:
+            pass
+        else:
+            raise AssertionError("T4 mutation authorization was accepted")
+
+        incomplete_t3_root = root / "incomplete"; incomplete_t3_root.mkdir()
+        incomplete = typed_control_return(incomplete_t3_root, "GROUNDED_COGNITIVE_FAILURE", tier="T3")
+        diagnosis = DISPATCH.pivot_from_receipt(incomplete)
+        assert diagnosis["packet"]["kind"] == "t4_diagnose"
+        assert diagnosis["packet"]["tool_mode"] == "read_only"
+        contradictory = DISPATCH.failure_pivot.build_control_return(
+            terminal_status="ABORTED", terminal_category="GROUNDED_COGNITIVE_FAILURE",
+            phase_key="coding:implement", resumable=False,
+            resume_checkpoint_present=False,
+            evidence_references=DISPATCH._terminal_evidence(root / "complete")[0],
+            failed_tier="T3",
+            worktree_evidence=t3["worktree_evidence"],
+            evidence_conflicts=[{"kind": "terminal-fact-mismatch", "sha256": "e" * 64}],
+        )
+        conflicting_diagnosis = DISPATCH.pivot_from_receipt(contradictory)
+        assert conflicting_diagnosis["packet"]["kind"] == "t4_diagnose"
+        assert conflicting_diagnosis["packet"]["evidence_bundle"]["completeness"] == "contradictory"
+        t4_payload = {
+            "schema_version": 1,
+            "kind": "t4_consult_result",
+            "adjudication": "The sealed evidence identifies one bounded correction.",
+            "direction": "run the bounded corrected mutation",
+            "allowed_mutation_scope": ["adaptive-workflow-router/scripts/workflow_dispatch.py"],
+            "next_tier": "T3",
+            "prohibited": ["repository_patch", "external_action", "authority_grant", "budget_increase"],
+        }
+        t4_observed = {
+            "execution_receipt_sha256": "1" * 64,
+            "model_output_sha256": DISPATCH.failure_pivot.content_hash(t4_payload),
+            "repository_path": consultation["packet"]["repository_scope"]["repository_path"],
+            "source_commit": consultation["packet"]["repository_scope"]["source_commit"],
+            "plan_id": t3["lineage_plan_id"],
+            "phase_key": t3["failed_phase"],
+            "phase_contract_sha256": t3["lineage_phase_contract_sha256"],
+            "prompt_sha256": t3["lineage_prompt_sha256"],
+            "worktree_admission": t3["worktree_evidence"]["admission"],
+            "worktree_final": t3["worktree_evidence"]["final"],
+            "sandbox": "read-only",
+            "network_access": False,
+            "tool_mode": consultation["packet"]["tool_mode"],
+            "mutation_authority": False,
+            "limits": consultation["packet"]["limits"],
+        }
+        t4_result = DISPATCH.failure_pivot.build_t4_result(
+            t4_pivot=consultation,
+            t4_control_return=t3,
+            result_payload=t4_payload,
+            observed_runtime=t4_observed,
+        )
+        fresh_t3_packet = {
+            "plan_id": "fresh-plan",
+            "phase_key": "coding:correct",
+            "phase_contract_sha256": "3" * 64,
+            "prompt_sha256": "4" * 64,
+            "cwd": consultation["packet"]["repository_scope"]["repository_path"],
+            "source_commit": consultation["packet"]["repository_scope"]["source_commit"],
+            "runtime_contract": {
+                "sandbox": "workspace-write", "mutation_authorized": True,
+                "planner_authorized_mutation_scope": [
+                    "adaptive-workflow-router/scripts/workflow_dispatch.py"
+                ],
+            },
+        }
+        fresh_t3_packet["dispatch_packet_sha256"] = DISPATCH.content_hash(fresh_t3_packet)
+        direction = DISPATCH.failure_pivot.build_t4_direction_to_t3_mutation_contract(
+            t4_result=t4_result,
+            t4_pivot=consultation,
+            t4_control_return=t3,
+            fresh_t3_dispatch_packet=fresh_t3_packet,
+        )
+        DISPATCH.failure_pivot.validate_t4_direction_to_t3_mutation_contract(
+            direction,
+            t4_result=t4_result,
+            t4_pivot=consultation,
+            t4_control_return=t3,
+            fresh_t3_dispatch_packet=fresh_t3_packet,
+        )
+        tampered_direction = dict(direction)
+        tampered_direction["next_tier"] = "T4"
+        try:
+            DISPATCH.failure_pivot.validate_t4_direction_to_t3_mutation_contract(
+                tampered_direction,
+                t4_result=t4_result,
+                t4_pivot=consultation,
+                t4_control_return=t3,
+                fresh_t3_dispatch_packet=fresh_t3_packet,
+            )
+        except DISPATCH.failure_pivot.FailurePivotContractError:
+            pass
+        else:
+            raise AssertionError("T4 direction could escape to a non-T3 tier")
+
+        tampered_admission = json.loads(json.dumps(t3))
+        tampered_admission["worktree_evidence"]["admission"]["source_commit"] = "d" * 40
+        try:
+            DISPATCH.validate_adaptive_control_return(tampered_admission)
+        except DISPATCH.DispatchError:
+            pass
+        else:
+            raise AssertionError("starting worktree evidence tampering was accepted")
+
+
+def test_pivot_authority_budget_and_break_glass_packets_never_dispatch_unsafely() -> None:
+    with tempfile.TemporaryDirectory(prefix="workflow-pivot-packets-") as temporary:
+        root = Path(temporary)
+        authority = DISPATCH.pivot_from_receipt(typed_control_return(root, "PARENT_GATE_REQUIRED"))
+        assert authority["action"] == "ask_user" and authority["packet"]["dispatch_permitted"] is False
+        budget = DISPATCH.pivot_from_receipt(typed_control_return(root, "BUDGET_STOP"))
+        assert budget["action"] == "partition" and budget["packet"]["budget_increase_permitted"] is False
+        break_glass = DISPATCH.pivot_from_receipt(typed_control_return(root, "HARNESS_UNAVAILABLE"))
+        assert break_glass["action"] == "abort"
+        assert break_glass["packet"]["read_only"] is True and break_glass["packet"]["mutation_authority"] is False
+
+
+def test_explicit_cap_contract_validation_is_called_for_missing_contract() -> None:
+    # This regression guard exercises the dispatcher-side invariant directly:
+    # a supplied cap may never take the derived envelope path without its contract.
+    try:
+        DISPATCH.validate_explicit_token_cap(20_000, None, {"task": "fixed"})
+    except DISPATCH.DispatchError as error:
+        assert "hashed" in str(error)
+    else:
+        raise AssertionError("missing fixed-cap contract was accepted")
+
+
+def test_t4_modes_are_deterministic_and_diagnose_tools_cannot_escape() -> None:
+    """Exercise the no-live-token T4 boundary directly, including edge paths.
+
+    This deliberately avoids the App Server: the boundary helpers are pure
+    local admission/tool code and must reject unsafe inputs before a model
+    turn is possible.
+    """
+    with tempfile.TemporaryDirectory(prefix="workflow-t4-boundary-") as temporary:
+        root = Path(temporary)
+        subprocess.run(["git", "init", "-q", str(root)], check=True)
+        subprocess.run(["git", "-C", str(root), "config", "user.name", "Harness Test"], check=True)
+        subprocess.run(["git", "-C", str(root), "config", "user.email", "harness@example.invalid"], check=True)
+        (root / "bounded.txt").write_text("needle\n", encoding="utf-8")
+        subprocess.run(["git", "-C", str(root), "add", "bounded.txt"], check=True)
+        subprocess.run(["git", "-C", str(root), "-c", "commit.gpgSign=false", "commit", "-qm", "fixture"], check=True)
+
+        # The selected T4 mode is a function only of grounded failure facts
+        # and the immutable evidence state, never of the failed model tier.
+        for tier in ("T1", "T2", "T3", "T4"):
+            complete = complete_typed_control_return(
+                root / f"complete-{tier}", "GROUNDED_COGNITIVE_FAILURE", tier=tier
+            )
+            assert DISPATCH.pivot_from_receipt(complete)["packet"]["kind"] == "t4_consult"
+        (root / "incomplete").mkdir()
+        incomplete = typed_control_return(root / "incomplete", "GROUNDED_COGNITIVE_FAILURE", tier="T3")
+        assert DISPATCH.pivot_from_receipt(incomplete)["packet"]["kind"] == "t4_diagnose"
+        contradictory_source = complete_typed_control_return(
+            root / "contradictory", "GROUNDED_COGNITIVE_FAILURE", tier="T3"
+        )
+        contradictory = DISPATCH.failure_pivot.build_control_return(
+            terminal_status="ABORTED", terminal_category="GROUNDED_COGNITIVE_FAILURE",
+            phase_key="coding:implement", resumable=False, resume_checkpoint_present=False,
+            evidence_references=contradictory_source["evidence_references"], failed_tier="T3",
+            worktree_evidence=contradictory_source["worktree_evidence"],
+            evidence_conflicts=[{"kind": "conflict", "sha256": "f" * 64}],
+        )
+        assert DISPATCH.pivot_from_receipt(contradictory)["packet"]["kind"] == "t4_diagnose"
+        (root / "authority").mkdir()
+        authority = typed_control_return(root / "authority", "PARENT_GATE_REQUIRED", tier="T4")
+        authority_pivot = DISPATCH.pivot_from_receipt(authority)
+        assert authority_pivot["action"] == "ask_user"
+        assert authority_pivot["packet"]["dispatch_permitted"] is False
+
+        surface = DISPATCH.t4_diagnose_dynamic_tools()
+        assert {item["name"] for item in surface} == {
+            "repo_list", "repo_read_text", "repo_search_text"
+        }
+        assert all(item["type"] == "function" for item in surface)
+        assert "needle" in DISPATCH.execute_t4_diagnose_tool(root, "repo_read_text", {"path": "bounded.txt"})
+        assert "bounded.txt" in DISPATCH.execute_t4_diagnose_tool(root, "repo_list", {"path": "."})
+        assert "needle" in DISPATCH.execute_t4_diagnose_tool(root, "repo_search_text", {"path": ".", "query": "needle"})
+        for tool, arguments in (
+            ("shell", {"path": "."}),
+            ("repo_read_text", {"path": "/etc/passwd"}),
+            ("repo_read_text", {"path": "../outside"}),
+            ("repo_read_text", {"path": "bounded.txt", "extra": True}),
+        ):
+            try:
+                DISPATCH.execute_t4_diagnose_tool(root, tool, arguments)
+            except DISPATCH.DispatchError:
+                pass
+            else:
+                raise AssertionError("unsafe diagnose tool request was accepted")
+        (root / "escape").symlink_to("/etc/passwd")
+        try:
+            DISPATCH.execute_t4_diagnose_tool(root, "repo_read_text", {"path": "escape"})
+        except (DISPATCH.DispatchError, OSError):
+            pass
+        else:
+            raise AssertionError("symlink escape was accepted")
+        (root / "large.txt").write_bytes(b"x" * (DISPATCH.T4_DIAGNOSE_TOOL_BYTE_CAP + 1))
+        try:
+            DISPATCH.execute_t4_diagnose_tool(root, "repo_read_text", {"path": "large.txt"})
+        except DISPATCH.DispatchError as error:
+            assert "byte cap" in str(error)
+        else:
+            raise AssertionError("oversize diagnose read was accepted")
+
+        consult_pivot = DISPATCH.pivot_from_receipt(
+            complete_typed_control_return(root / "result", "GROUNDED_COGNITIVE_FAILURE", tier="T3")
+        )
+        valid_result = {
+            "schema_version": 1, "kind": "t4_consult_result",
+            "adjudication": "Grounded conclusion.", "direction": "Apply the bounded correction.",
+            "allowed_mutation_scope": ["bounded.txt"], "next_tier": "T3",
+            "prohibited": ["repository_patch", "external_action", "authority_grant", "budget_increase"],
+        }
+        assert DISPATCH.parse_t4_result(consult_pivot, json.dumps(valid_result))["next_tier"] == "T3"
+        for malformed in ("not json", json.dumps({**valid_result, "extra": 1}), json.dumps({**valid_result, "next_tier": "T4"})):
+            try:
+                DISPATCH.parse_t4_result(consult_pivot, malformed)
+            except DISPATCH.DispatchError:
+                pass
+            else:
+                raise AssertionError("malformed T4 output was accepted")
+
+
+def test_dispatcher_has_no_shadowed_failure_pivot_implementations() -> None:
+    """The adapter must call the canonical source, not leave dead v1 shadows."""
+    source = SCRIPT.read_text(encoding="utf-8")
+    for name in (
+        "build_adaptive_control_return",
+        "validate_adaptive_control_return",
+        "pivot_from_receipt",
+        "validate_pivot",
+    ):
+        assert source.count(f"def {name}(") == 1, f"shadowed {name} implementation remains"
+
+
+def test_t4_result_seals_one_fresh_t3_direction_without_granting_mutation() -> None:
+    """A model result can direct a new T3 route, never synthesize authority."""
+    with tempfile.TemporaryDirectory(prefix="workflow-t4-result-chain-") as temporary:
+        root = Path(temporary)
+        control = complete_typed_control_return(
+            root, "GROUNDED_COGNITIVE_FAILURE", tier="T3"
+        )
+        pivot = DISPATCH.pivot_from_receipt(control)
+        packet = pivot["packet"]
+        payload = {
+            "schema_version": 1, "kind": "t4_consult_result",
+            "adjudication": "The evidence identifies one bounded correction.",
+            "direction": "Apply only the checked correction.",
+            "allowed_mutation_scope": ["target.py"], "next_tier": "T3",
+            "prohibited": ["repository_patch", "external_action", "authority_grant", "budget_increase"],
+        }
+        observed = {
+            "execution_receipt_sha256": "1" * 64,
+            "model_output_sha256": DISPATCH.failure_pivot.content_hash(payload),
+            "repository_path": packet["repository_scope"]["repository_path"],
+            "source_commit": packet["repository_scope"]["source_commit"],
+            "plan_id": control["lineage_plan_id"], "phase_key": control["failed_phase"],
+            "phase_contract_sha256": control["lineage_phase_contract_sha256"],
+            "prompt_sha256": control["lineage_prompt_sha256"],
+            "worktree_admission": control["worktree_evidence"]["admission"],
+            "worktree_final": control["worktree_evidence"]["final"],
+            "sandbox": "read-only", "network_access": False,
+            "tool_mode": packet["tool_mode"], "mutation_authority": False,
+            "limits": packet["limits"],
+        }
+        result = DISPATCH.failure_pivot.build_t4_result(
+            t4_pivot=pivot, t4_control_return=control,
+            result_payload=payload, observed_runtime=observed,
+        )
+        DISPATCH.failure_pivot.validate_t4_result(
+            result, t4_pivot=pivot, t4_control_return=control
+        )
+        fresh_packet = {
+            "plan_id": "fresh-plan", "phase_key": "coding:correct",
+            "phase_contract_sha256": "3" * 64, "prompt_sha256": "4" * 64,
+            "cwd": packet["repository_scope"]["repository_path"],
+            "source_commit": packet["repository_scope"]["source_commit"],
+            "runtime_contract": {
+                "sandbox": "workspace-write", "mutation_authorized": True,
+                "planner_authorized_mutation_scope": ["target.py"],
+            },
+        }
+        fresh_packet["dispatch_packet_sha256"] = DISPATCH.content_hash(fresh_packet)
+        direction = DISPATCH.failure_pivot.build_t4_direction_to_t3_mutation_contract(
+            t4_result=result, t4_pivot=pivot, t4_control_return=control,
+            fresh_t3_dispatch_packet=fresh_packet,
+        )
+        DISPATCH.failure_pivot.validate_t4_direction_to_t3_mutation_contract(
+            direction, t4_result=result, t4_pivot=pivot, t4_control_return=control,
+            fresh_t3_dispatch_packet=fresh_packet,
+        )
+        assert direction["parent_mutation_authority"] == "not_granted"
+        assert direction["allowed_mutation_scope"] == ["target.py"]
+
+        # Every lineage input is hash-bound.  A self-rehashed foreign phase,
+        # old prompt, changed checkpoint/result, or unsafe path cannot be
+        # converted into a T3 mutation direction.
+        stale_prompt = dict(fresh_packet)
+        stale_prompt["prompt_sha256"] = control["lineage_prompt_sha256"]
+        stale_prompt["dispatch_packet_sha256"] = DISPATCH.content_hash(
+            {key: value for key, value in stale_prompt.items() if key != "dispatch_packet_sha256"}
+        )
+        for bad_packet in (
+            stale_prompt,
+            {**fresh_packet, "cwd": "/outside"},
+            {**fresh_packet, "runtime_contract": {"sandbox": "workspace-write", "mutation_authorized": False}},
+        ):
+            if "dispatch_packet_sha256" in bad_packet:
+                bad_packet = dict(bad_packet)
+                bad_packet["dispatch_packet_sha256"] = DISPATCH.content_hash(
+                    {key: value for key, value in bad_packet.items() if key != "dispatch_packet_sha256"}
+                )
+            try:
+                DISPATCH.failure_pivot.build_t4_direction_to_t3_mutation_contract(
+                    t4_result=result, t4_pivot=pivot, t4_control_return=control,
+                    fresh_t3_dispatch_packet=bad_packet,
+                )
+            except DISPATCH.failure_pivot.FailurePivotContractError:
+                pass
+            else:
+                raise AssertionError("unsafe or stale T3 packet was admitted")
+        changed_result = json.loads(json.dumps(result))
+        changed_result["result_payload"]["allowed_mutation_scope"] = ["../escape"]
+        changed_bare = dict(changed_result); changed_bare.pop("result_sha256")
+        changed_result["result_sha256"] = DISPATCH.content_hash(changed_bare)
+        try:
+            DISPATCH.failure_pivot.validate_t4_result(
+                changed_result, t4_pivot=pivot, t4_control_return=control
+            )
+        except DISPATCH.failure_pivot.FailurePivotContractError:
+            pass
+        else:
+            raise AssertionError("unsafe T4 writable path was accepted")
+
+
+def test_t3_direction_requires_retained_result_in_fresh_bound_context() -> None:
+    """T4 direction reaches T3 only through the packet-bound retained result."""
+    with tempfile.TemporaryDirectory(prefix="workflow-t4-bound-result-context-") as temporary:
+        root = Path(temporary)
+        control = complete_typed_control_return(
+            root / "control", "GROUNDED_COGNITIVE_FAILURE", tier="T3"
+        )
+        repository = root / "control"
+        (repository / "target.py").write_text("value = 1\n", encoding="utf-8")
+        pivot = DISPATCH.pivot_from_receipt(control)
+        payload = {
+            "schema_version": 1,
+            "kind": "t4_consult_result",
+            "adjudication": "The retained evidence identifies the bounded target.",
+            "direction": "Modify only target.py.",
+            "allowed_mutation_scope": ["target.py"],
+            "next_tier": "T3",
+            "prohibited": [
+                "repository_patch", "external_action", "authority_grant", "budget_increase",
+            ],
+        }
+        observed = {
+            "execution_receipt_sha256": "1" * 64,
+            "model_output_sha256": DISPATCH.failure_pivot.content_hash(payload),
+            "repository_path": str(repository.resolve()),
+            "source_commit": pivot["packet"]["repository_scope"]["source_commit"],
+            "plan_id": control["lineage_plan_id"],
+            "phase_key": control["failed_phase"],
+            "phase_contract_sha256": control["lineage_phase_contract_sha256"],
+            "prompt_sha256": control["lineage_prompt_sha256"],
+            "worktree_admission": control["worktree_evidence"]["admission"],
+            "worktree_final": control["worktree_evidence"]["final"],
+            "sandbox": "read-only",
+            "network_access": False,
+            "tool_mode": pivot["packet"]["tool_mode"],
+            "mutation_authority": False,
+            "limits": pivot["packet"]["limits"],
+        }
+        result = DISPATCH.failure_pivot.build_t4_result(
+            t4_pivot=pivot, t4_control_return=control,
+            result_payload=payload, observed_runtime=observed,
+        )
+        result_path = root / "retained-t4-result.json"
+        DISPATCH.write_json(result_path, result)
+        fresh_packet = {
+            "plan_id": "fresh-plan",
+            "phase_key": "coding:correct",
+            "phase_contract_sha256": "3" * 64,
+            "prompt_sha256": "4" * 64,
+            "cwd": str(repository.resolve()),
+            "source_commit": pivot["packet"]["repository_scope"]["source_commit"],
+            "runtime_contract": {
+                "sandbox": "workspace-write",
+                "mutation_authorized": True,
+                "planner_authorized_mutation_scope": ["target.py"],
+            },
+        }
+        fresh_packet["dispatch_packet_sha256"] = DISPATCH.content_hash(fresh_packet)
+        direction = DISPATCH.failure_pivot.build_t4_direction_to_t3_mutation_contract(
+            t4_result=result, t4_pivot=pivot, t4_control_return=control,
+            fresh_t3_dispatch_packet=fresh_packet,
+        )
+        pivot_path = root / "pivot.json"; DISPATCH.write_json(pivot_path, pivot)
+        control_path = root / "control-return.json"; DISPATCH.write_json(control_path, control)
+        direction_path = root / "direction.json"; DISPATCH.write_json(direction_path, direction)
+        result_raw = result_path.read_bytes()
+        args = argparse.Namespace(
+            t4_pivot=pivot_path,
+            t4_control_return=control_path,
+            t4_result=result_path,
+            t4_direction_contract=direction_path,
+            mutation_authorized=True,
+        )
+        request = {"mutation": "workspace-write"}
+        resolution = {"tier": "T3"}
+        plan_binding = {"dispatch_packet": fresh_packet}
+        bound_context = [{
+            "path": str(result_path.resolve()), "sha256": DISPATCH.sha256_bytes(result_raw),
+            "bytes": len(result_raw),
+        }]
+        with patched_dispatch(
+            source_commit_for=lambda unused_cwd: fresh_packet["source_commit"]
+        ):
+            DISPATCH.validate_t3_direction_admission(
+                args, request, resolution, cwd=repository, plan_binding=plan_binding,
+                context_records=bound_context,
+            )
+            try:
+                DISPATCH.validate_t3_direction_admission(
+                args, request, resolution, cwd=repository, plan_binding=plan_binding,
+                    context_records=[],
+                )
+            except DISPATCH.DispatchError as error:
+                assert "pre-bind the retained T4 result" in str(error)
+            else:
+                raise AssertionError("unbound T4 result was admitted to fresh T3")
+
+
+def test_t4_tool_visible_snapshot_binds_untracked_and_excludes_ignored() -> None:
+    """Ignored files cannot evade a T4 snapshot because tools cannot read them."""
+    with tempfile.TemporaryDirectory(prefix="workflow-t4-visible-snapshot-") as temporary:
+        root = Path(temporary)
+        for command in (
+            ["git", "init", "-q", str(root)],
+            ["git", "-C", str(root), "config", "user.email", "tests@example.invalid"],
+            ["git", "-C", str(root), "config", "user.name", "Workflow Tests"],
+        ):
+            subprocess.run(command, check=True, capture_output=True)
+        (root / ".gitignore").write_text("ignored/\n", encoding="utf-8")
+        (root / "tracked.txt").write_text("tracked\n", encoding="utf-8")
+        subprocess.run(
+            ["git", "-C", str(root), "add", ".gitignore", "tracked.txt"],
+            check=True, capture_output=True,
+        )
+        subprocess.run(
+            ["git", "-C", str(root), "-c", "commit.gpgSign=false", "commit", "-qm", "fixture"],
+            check=True, capture_output=True,
+        )
+        (root / "visible.txt").write_text("visible one\n", encoding="utf-8")
+        (root / "ignored").mkdir()
+        (root / "ignored" / "cache.txt").write_text("secret one\n", encoding="utf-8")
+        before, visible = DISPATCH._tool_visible_repository_snapshot(root)
+        assert {"tracked.txt", "visible.txt"} <= set(visible)
+        assert "ignored/cache.txt" not in visible
+        assert "visible one" in DISPATCH.execute_t4_diagnose_tool(
+            root, "repo_read_text", {"path": "visible.txt"}, visible_paths=visible,
+        )
+        for forbidden in ("ignored/cache.txt", ".git/config"):
+            try:
+                DISPATCH.execute_t4_diagnose_tool(
+                    root, "repo_read_text", {"path": forbidden}, visible_paths=visible,
+                )
+            except DISPATCH.DispatchError:
+                pass
+            else:
+                raise AssertionError("diagnose tool read outside its sealed scope")
+        (root / "visible.txt").write_text("visible two\n", encoding="utf-8")
+        try:
+            DISPATCH.execute_t4_diagnose_tool(
+                root, "repo_read_text", {"path": "visible.txt"}, visible_paths=visible,
+            )
+        except DISPATCH.DispatchError as error:
+            assert "changed after the sealed snapshot" in str(error)
+        else:
+            raise AssertionError("post-snapshot file mutation was returned to T4")
+        changed_visible, _ = DISPATCH._tool_visible_repository_snapshot(root)
+        assert changed_visible != before
+        (root / "visible.txt").write_text("visible one\n", encoding="utf-8")
+        restored, _ = DISPATCH._tool_visible_repository_snapshot(root)
+        (root / "ignored" / "cache.txt").write_text("secret two\n", encoding="utf-8")
+        unchanged_ignored, _ = DISPATCH._tool_visible_repository_snapshot(root)
+        assert restored == unchanged_ignored
+
+
+def test_t4_feature_enumeration_is_closed_before_server_start() -> None:
+    """A new runner feature is an admission failure, never an implicit tool."""
+    original_run = DISPATCH.subprocess.run
+    try:
+        DISPATCH.subprocess.run = lambda *args, **kwargs: SimpleNamespace(  # type: ignore[assignment]
+            returncode=0, stdout="shell_tool stable true\nmulti_agent stable true\n", stderr=""
+        )
+        assert DISPATCH.configured_t4_feature_names(Path("/runner")) == (
+            "multi_agent", "shell_tool",
+        )
+        DISPATCH.subprocess.run = lambda *args, **kwargs: SimpleNamespace(  # type: ignore[assignment]
+            returncode=0, stdout="future_unreviewed_tool stable true\n", stderr=""
+        )
+        try:
+            DISPATCH.configured_t4_feature_names(Path("/runner"))
+        except DISPATCH.DispatchError as error:
+            assert "unreviewed" in str(error)
+        else:
+            raise AssertionError("unreviewed App Server feature was admitted")
+    finally:
+        DISPATCH.subprocess.run = original_run  # type: ignore[assignment]
+
+
+def test_observed_t3_exit_gate_produces_grounded_t4_pivot() -> None:
+    """Retained observed output, not a caller flag, selects a T4 mode."""
+    issue = "final output did not match the deterministic smoke expectation"
+    category, gate = DISPATCH.observed_terminal_category(
+        [issue], resolution={"tier": "T3"}, plan_bound=True,
+    )
+    assert category == "GROUNDED_COGNITIVE_FAILURE"
+    assert gate == "expect_exact_output"
+    category, gate = DISPATCH.observed_terminal_category(
+        [issue], resolution={"tier": "T2"}, plan_bound=True,
+    )
+    assert category == "EXIT_GATE_FAILURE"
+    assert gate == "expect_exact_output"
 if __name__ == "__main__":
     tests = (
         test_environment_cannot_assert_source_provenance,
@@ -4385,6 +5264,8 @@ if __name__ == "__main__":
         test_malformed_event_shapes_become_dispatch_errors,
         test_no_tools_contract_requires_read_only_offline_execution,
         test_planner_dispatch_packet_binds_exact_inputs,
+        test_planned_run_accepts_bound_cap_without_caller_cap_and_rebuilds_scope,
+        test_health_packet_args_bind_planner_cap_and_exact_scope,
         test_workflow_plan_identity_and_active_phase_are_enforced,
         test_self_rehashed_semantically_invalid_plans_are_rejected,
         test_explicit_token_cap_requires_a_fixed_task_contract,
@@ -4395,6 +5276,17 @@ if __name__ == "__main__":
         test_checkpoint_restart_uses_fresh_turn_and_only_unfinished_work,
         test_deterministic_quality_is_recomputed_before_registration,
         test_blind_quality_is_bound_to_registered_grader_output,
+        test_v1_control_return_remains_valid_and_v2_evidence_is_tamper_evident,
+        test_pivot_state_machine_is_exact_idempotent_and_t4_is_read_only,
+        test_pivot_authority_budget_and_break_glass_packets_never_dispatch_unsafely,
+        test_explicit_cap_contract_validation_is_called_for_missing_contract,
+        test_t4_modes_are_deterministic_and_diagnose_tools_cannot_escape,
+        test_dispatcher_has_no_shadowed_failure_pivot_implementations,
+        test_t4_result_seals_one_fresh_t3_direction_without_granting_mutation,
+        test_t3_direction_requires_retained_result_in_fresh_bound_context,
+        test_t4_tool_visible_snapshot_binds_untracked_and_excludes_ignored,
+        test_t4_feature_enumeration_is_closed_before_server_start,
+        test_observed_t3_exit_gate_produces_grounded_t4_pivot,
     )
     if os.environ.get("ADAPTIVE_RESUME_CANARY_ONLY") == "1":
         tests = (test_checkpoint_restart_uses_fresh_turn_and_only_unfinished_work,)

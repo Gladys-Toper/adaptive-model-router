@@ -44,6 +44,8 @@ from typing import Any
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import agent_governance as governance  # noqa: E402
+import failure_pivot_contract as pivots  # noqa: E402
+import token_cap_contract as token_caps  # noqa: E402
 import workflow_plan as planner  # noqa: E402
 
 
@@ -83,6 +85,8 @@ EVIDENCE_GRADE = "declared"
 RUNTIME_LABEL = "claude-code-headless-cli"
 
 MODEL_TIERS = {"T1", "T2", "T3", "T4"}
+ADAPTIVE_CONTROL_RETURN_NAME = pivots.CONTROL_RETURN_NAME
+ADAPTIVE_PIVOT_NAME = pivots.PIVOT_NAME
 HEADLESS_EFFORTS = ("low", "medium", "high")
 UNVERSIONED_SOURCE_COMMIT = "0" * 40
 DISPATCH_TIMEOUT_RETURNCODE = -9001  # sentinel: wall-time cap expired before process exit
@@ -189,6 +193,211 @@ def sha256_bytes(value: bytes) -> str:
 
 def utc_now() -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
+def _control_return_evidence(root: Path) -> list[dict[str, str]]:
+    """Reference immutable terminal artifacts without making them portable claims."""
+    references: list[dict[str, str]] = []
+    for name in (
+        "input-manifest.json",
+        "prompt.txt",
+        "execution-metadata.json",
+        "aborted.json",
+        "execution-receipt.json",
+    ):
+        path = root / name
+        if path.is_symlink() or not path.is_file():
+            continue
+        resolved = path.resolve(strict=True)
+        references.append({"path": str(resolved), "sha256": sha256_bytes(resolved.read_bytes())})
+    for path in sorted(root.glob("resume-checkpoint.*.json")):
+        if path.is_symlink() or not path.is_file():
+            continue
+        resolved = path.resolve(strict=True)
+        references.append({"path": str(resolved), "sha256": sha256_bytes(resolved.read_bytes())})
+    return references
+
+
+def _tool_visible_snapshot(cwd: Path) -> str:
+    """Hash the regular repository files a read-only worker could observe.
+
+    Claude's headless adapter deliberately does not execute T4, but its typed
+    control returns must still use the canonical closed snapshot shape.  This
+    is a deterministic local observation; it never invokes a model or grants
+    a read/write capability.
+    """
+    root = cwd.expanduser().resolve(strict=True)
+    try:
+        listed = subprocess.run(
+            ["git", "-C", str(root), "ls-files", "-z", "--cached", "--others", "--exclude-standard"],
+            text=False, capture_output=True, check=False, timeout=20,
+        )
+        diff = subprocess.run(
+            ["git", "-C", str(root), "diff", "--binary", "HEAD"],
+            text=False, capture_output=True, check=False, timeout=20,
+        )
+    except (OSError, subprocess.SubprocessError) as error:
+        raise DispatchError("repository tool-visible snapshot cannot be sealed") from error
+    if listed.returncode != 0 or diff.returncode != 0:
+        raise DispatchError("repository tool-visible snapshot cannot be sealed")
+    listed_bytes = listed.stdout if isinstance(listed.stdout, bytes) else (listed.stdout or "").encode("utf-8")
+    diff_bytes = diff.stdout if isinstance(diff.stdout, bytes) else (diff.stdout or "").encode("utf-8")
+    entries: list[dict[str, Any]] = []
+    for raw in listed_bytes.split(b"\0"):
+        if not raw:
+            continue
+        try:
+            relative = raw.decode("utf-8")
+        except UnicodeDecodeError as error:
+            raise DispatchError("repository contains a non-UTF-8 tool-visible path") from error
+        candidate = Path(relative)
+        if not relative or candidate.is_absolute() or ".." in candidate.parts or ".git" in candidate.parts:
+            raise DispatchError("repository tool-visible path is unsafe")
+        absolute = root / candidate
+        try:
+            info = absolute.lstat()
+        except OSError as error:
+            raise DispatchError("repository changed while tool-visible scope was sealed") from error
+        if not stat.S_ISREG(info.st_mode):
+            raise DispatchError("repository tool-visible path is not a regular file")
+        digest = hashlib.sha256()
+        try:
+            with absolute.open("rb", buffering=0) as source:
+                while True:
+                    chunk = source.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    digest.update(chunk)
+        except OSError as error:
+            raise DispatchError("repository tool-visible file cannot be read") from error
+        entries.append({
+            "path": candidate.as_posix(), "mode": info.st_mode,
+            "kind": "file", "sha256": digest.hexdigest(),
+        })
+    return content_hash({
+        "schema_version": 1,
+        "git_diff_binary_sha256": sha256_bytes(diff_bytes),
+        "entries": sorted(entries, key=lambda entry: entry["path"]),
+    })
+
+
+def worktree_snapshot(cwd: Path) -> dict[str, Any]:
+    """Capture the canonical closed git/tool-visible terminal snapshot."""
+    worktree = cwd.expanduser().resolve(strict=True)
+    try:
+        source_commit = source_commit_for(worktree)
+        visible_snapshot = _tool_visible_snapshot(worktree)
+        status = subprocess.run(
+            ["git", "-C", str(worktree), "status", "--porcelain"],
+            text=True, capture_output=True, check=False, timeout=10,
+        )
+        tracked_diff = subprocess.run(
+            ["git", "-C", str(worktree), "diff", "--binary"],
+            text=True, capture_output=True, check=False, timeout=10,
+        )
+        if status.returncode != 0 or tracked_diff.returncode != 0:
+            state, diff_sha = "unknown", None
+        else:
+            state = "dirty" if status.stdout.strip() else "clean"
+            diff_sha = sha256_bytes(tracked_diff.stdout.encode("utf-8"))
+    except (OSError, subprocess.SubprocessError, DispatchError):
+        source_commit, state, diff_sha = UNVERSIONED_SOURCE_COMMIT, "unknown", None
+        visible_snapshot = content_hash({"schema_version": 1, "unavailable": str(worktree)})
+    return {
+        "source_commit": source_commit,
+        "worktree": str(worktree),
+        "status": state,
+        "tracked_diff_sha256": diff_sha,
+        "tool_visible_snapshot_sha256": visible_snapshot,
+    }
+
+
+def build_adaptive_control_return(
+    *,
+    terminal_status: str,
+    terminal_category: str | None,
+    phase_key: str | None,
+    root: Path,
+    cwd: Path,
+    resumable: bool = False,
+    failed_tier: str | None = None,
+    retry_escalation_count: int = 0,
+    issues: list[str] | None = None,
+    admission_worktree_evidence: dict[str, Any] | None = None,
+    allowed_mutation_scope: str = "none",
+) -> dict[str, Any]:
+    """Build the v2 coordinator handoff; it never supplies execution authority."""
+    worktree = cwd.expanduser().resolve(strict=True)
+    final_snapshot = worktree_snapshot(worktree)
+    admission_snapshot = admission_worktree_evidence or final_snapshot
+    evidence = _control_return_evidence(root)
+    try:
+        return pivots.build_control_return(
+            terminal_status=terminal_status,
+            terminal_category=terminal_category,
+            phase_key=phase_key,
+            resumable=resumable,
+            resume_checkpoint_present=any(
+                "resume-checkpoint." in item["path"] for item in evidence
+            ),
+            evidence_references=evidence,
+            retry_escalation_count=retry_escalation_count,
+            issues=issues,
+            failed_tier=failed_tier,
+            worktree_evidence={
+                "admission": admission_snapshot,
+                "final": final_snapshot,
+                "allowed_mutation_scope": allowed_mutation_scope,
+            },
+        )
+    except pivots.FailurePivotContractError as error:
+        raise DispatchError(str(error)) from error
+
+
+def validate_adaptive_control_return(directive: dict[str, Any]) -> None:
+    try:
+        pivots.validate_control_return(directive)
+    except pivots.FailurePivotContractError as error:
+        raise DispatchError(str(error)) from error
+
+
+def validate_control_return_evidence(directive: dict[str, Any]) -> None:
+    """Re-read every v2 artifact before following a recovery handoff."""
+    validate_adaptive_control_return(directive)
+    if directive.get("schema_version") == 1:
+        return
+    for reference in directive["evidence_references"]:
+        path = Path(reference["path"])
+        if path.is_symlink() or not path.is_file():
+            raise DispatchError("control-return evidence is missing or unsafe")
+        if sha256_bytes(path.resolve(strict=True).read_bytes()) != reference["sha256"]:
+            raise DispatchError("control-return evidence hash changed")
+    final_snapshot = directive["worktree_evidence"]["final"]
+    try:
+        current_snapshot = worktree_snapshot(Path(final_snapshot["worktree"]))
+    except (OSError, RuntimeError) as error:
+        raise DispatchError("control-return worktree snapshot is unavailable") from error
+    if current_snapshot != final_snapshot:
+        raise DispatchError("control-return tool-visible worktree snapshot changed")
+
+
+def pivot_from_receipt(
+    directive: dict[str, Any], *, previous_pivot: dict[str, Any] | None = None
+) -> dict[str, Any]:
+    validate_control_return_evidence(directive)
+    try:
+        pivot = pivots.derive_pivot(directive, previous_pivot)
+        pivots.validate_pivot(pivot)
+        return pivot
+    except pivots.FailurePivotContractError as error:
+        raise DispatchError(str(error)) from error
+
+
+def validate_pivot(pivot: dict[str, Any]) -> None:
+    try:
+        pivots.validate_pivot(pivot)
+    except pivots.FailurePivotContractError as error:
+        raise DispatchError(str(error)) from error
 
 
 def read_bound_json(path: Path, label: str) -> tuple[Path, bytes, dict[str, Any]]:
@@ -607,6 +816,30 @@ def observed_models(metadata: dict[str, Any]) -> list[str]:
     return sorted(str(slug) for slug in metadata.get("model_usage", {}))
 
 
+def observed_cumulative_tokens(metadata: dict[str, Any]) -> dict[str, int]:
+    """Return the terminal stream's cumulative input/output accounting.
+
+    Claude's headless stream is not provider-signed evidence, but its terminal
+    ``usage`` object is the only first-party observed cumulative accounting
+    this adapter receives.  Do not substitute a guessed value (or just output
+    tokens): an incomplete accounting record cannot establish that the fixed
+    cap was respected.
+    """
+    usage = metadata.get("usage")
+    if not isinstance(usage, dict):
+        raise DispatchError("claude terminal result omitted cumulative usage")
+    values: dict[str, int] = {}
+    for field in ("input_tokens", "output_tokens"):
+        value = usage.get(field)
+        if type(value) is not int or value < 0:
+            raise DispatchError(
+                "claude terminal result has invalid cumulative usage " + field
+            )
+        values[field] = value
+    values["total_tokens"] = values["input_tokens"] + values["output_tokens"]
+    return values
+
+
 # --------------------------------------------------------------------------
 # Packet + plan binding
 # --------------------------------------------------------------------------
@@ -698,6 +931,96 @@ def verify_runtime_contract(
     return contract
 
 
+def validate_bound_token_cap(
+    packet: dict[str, Any], phase: dict[str, Any], args: argparse.Namespace
+) -> int:
+    """Require a self-hashed cap contract before Claude model invocation.
+
+    The raw Claude stream does not expose a server-enforced token ceiling, so
+    the adapter preserves the planner's fixed cap authority in the packet and
+    validates the coupled evidence before it starts the CLI process.
+    """
+    runtime = packet.get("runtime_contract")
+    if not isinstance(runtime, dict):
+        raise DispatchError("planner dispatch packet omitted its runtime cap contract")
+    required = (
+        "declared_token_cap",
+        "derived_token_cap",
+        "effective_token_cap",
+        "caller_requested_token_cap",
+        "token_cap_contract_sha256",
+        "token_cap_task_binding_sha256",
+        "dispatch_packet_binding_sha256",
+    )
+    if any(field not in runtime for field in required):
+        raise DispatchError("planner dispatch packet omitted a fixed token-cap binding")
+    declared, derived, effective = (
+        runtime["declared_token_cap"],
+        runtime["derived_token_cap"],
+        runtime["effective_token_cap"],
+    )
+    if (
+        any(type(value) is not int or value < 1 for value in (declared, derived, effective))
+        or effective > declared
+        or effective > derived
+        or runtime.get("requested_budget_limits", {}).get("token_cap") != effective
+    ):
+        raise DispatchError("planner dispatch packet has unsafe token-cap limits")
+    if (
+        not isinstance(runtime["token_cap_contract_sha256"], str)
+        or not HEX_SHA256.fullmatch(runtime["token_cap_contract_sha256"])
+        or not isinstance(runtime["token_cap_task_binding_sha256"], str)
+        or not HEX_SHA256.fullmatch(runtime["token_cap_task_binding_sha256"])
+        or not isinstance(runtime["dispatch_packet_binding_sha256"], str)
+        or not HEX_SHA256.fullmatch(runtime["dispatch_packet_binding_sha256"])
+    ):
+        raise DispatchError("planner dispatch packet omitted a cap-contract binding")
+    if args.token_cap is not None and args.token_cap != effective:
+        raise DispatchError("--token-cap differs from the planner-bound effective cap")
+    if args.token_cap_contract is None:
+        raise DispatchError("planner-bound model execution requires --token-cap-contract")
+    contract_path, contract_raw, contract = read_bound_json(
+        args.token_cap_contract, "fixed token-cap contract"
+    )
+    if sha256_bytes(contract_raw) != runtime["token_cap_contract_sha256"]:
+        raise DispatchError("provided fixed token-cap contract does not match planner packet")
+    binding = token_caps.token_cap_binding(
+        plan_id=packet["plan_id"],
+        phase_key=phase["phase_key"],
+        phase_contract_sha256=packet["phase_contract_sha256"],
+        route_identity={
+            "request": phase["route_request"],
+            "resolution": phase["route_resolution"],
+        },
+        prompt_sha256=packet["prompt_sha256"],
+        context_files=packet["context_files"],
+        context_bundle=packet["context_bundle"],
+        cwd=packet["cwd"],
+        source_commit=packet["source_commit"],
+        runtime_contract=runtime,
+        dispatch_packet_binding_sha256=runtime["dispatch_packet_binding_sha256"],
+    )
+    binding_sha256 = token_caps.content_hash(binding)
+    if binding_sha256 != runtime["token_cap_task_binding_sha256"]:
+        raise DispatchError("planner dispatch packet fixed token-cap task binding changed")
+    evidence_path, evidence_raw, evidence = read_bound_json(
+        Path(contract["measured_safe_evidence_path"]), "fixed token-cap evidence"
+    )
+    if evidence_path == contract_path:
+        raise DispatchError("fixed token-cap evidence is missing or does not bind this task")
+    try:
+        token_caps.validate_token_cap_contract(
+            contract,
+            task_binding=binding,
+            runtime_contract=runtime,
+            evidence=evidence,
+            evidence_raw_sha256=sha256_bytes(evidence_raw),
+        )
+    except token_caps.TokenCapContractError as error:
+        raise DispatchError(str(error)) from error
+    return effective
+
+
 def permission_flags(
     contract: dict[str, Any],
 ) -> tuple[str, tuple[str, ...], tuple[str, ...]]:
@@ -742,6 +1065,74 @@ def budget_usd_for(resolution: dict[str, Any], contract: dict[str, Any]) -> floa
     return round(cost_weight * max(wall_time, 1) / 60.0, 4)
 
 
+def _stream_event_count(raw: str) -> int:
+    """Count parseable retained events without rejecting partial abort evidence."""
+    count = 0
+    for line in raw.splitlines():
+        if not line.strip():
+            continue
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(event, dict):
+            count += 1
+    return count
+
+
+def persist_terminal_control_return(
+    *,
+    run_dir: Path,
+    cwd: Path,
+    receipt_payload: dict[str, Any],
+    terminal_status: str,
+    terminal_category: str | None,
+    issues: list[str],
+    phase_key: str,
+    tier: str,
+    admission_worktree_evidence: dict[str, Any],
+    allowed_mutation_scope: str,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Persist terminal provenance before exposing either outcome to a caller.
+
+    A failed Claude invocation has no resumable execution state.  Retaining the
+    raw stream alone is insufficient: recovery needs a typed, hash-bound control
+    return just as much as a successful phase does.  Write the failure marker
+    before the registry receipt so the resulting control return can bind both
+    immutable terminal artifacts without a self-reference.
+    """
+    if terminal_status != "COMPLETED":
+        _atomic_private_bytes(
+            run_dir / "aborted.json",
+            (json.dumps({
+                "status": terminal_status,
+                "terminal_category": terminal_category,
+                "issues": issues,
+            }, indent=2, sort_keys=True) + "\n").encode("utf-8"),
+        )
+    receipt = append_registry_receipt("execution", receipt_payload)
+    _atomic_private_bytes(
+        run_dir / "execution-receipt.json",
+        (json.dumps(receipt, indent=2, sort_keys=True) + "\n").encode("utf-8"),
+    )
+    directive = build_adaptive_control_return(
+        terminal_status=terminal_status,
+        terminal_category=terminal_category,
+        phase_key=phase_key,
+        root=run_dir,
+        cwd=cwd,
+        failed_tier=tier,
+        issues=issues,
+        admission_worktree_evidence=admission_worktree_evidence,
+        allowed_mutation_scope=allowed_mutation_scope,
+    )
+    _atomic_private_bytes(
+        run_dir / "control-return.json",
+        (json.dumps(directive, indent=2, sort_keys=True) + "\n").encode("utf-8"),
+    )
+    return receipt, directive
+
+
 # --------------------------------------------------------------------------
 # Commands
 # --------------------------------------------------------------------------
@@ -774,6 +1165,10 @@ def command_check() -> dict[str, Any]:
         "headless_efforts": list(HEADLESS_EFFORTS),
         "headless_tiers": ["T1", "T2", "T3"],
         "in_session_tiers": ["T4"],
+        "t4_execution_modes": {
+            "t4_consult": "UNAVAILABLE_CLAUDE_HEADLESS_ENFORCEMENT",
+            "t4_diagnose": "UNAVAILABLE_CLAUDE_HEADLESS_ENFORCEMENT",
+        },
         "resumption": "ABORTED_NO_RESUMABLE_CHECKPOINT",
         "router_policy_id": status.get("policy_id"),
         "routing_status": status.get("routing_status"),
@@ -796,6 +1191,7 @@ def command_run(args: argparse.Namespace, *, CLI: type[ClaudeCLI] = ClaudeCLI) -
     verify_dispatch_packet(packet, plan, phase)
     prompt = args.prompt_file.expanduser().read_text(encoding="utf-8")
     contract = verify_runtime_contract(packet, args, prompt)
+    token_cap = validate_bound_token_cap(packet, phase, args)
 
     effort = resolution.get("effort")
     if tier == "T4" or effort not in HEADLESS_EFFORTS:
@@ -828,6 +1224,23 @@ def command_run(args: argparse.Namespace, *, CLI: type[ClaudeCLI] = ClaudeCLI) -
     cwd = Path(packet["cwd"]).expanduser()
     if not cwd.is_dir():
         raise DispatchError(f"dispatch cwd does not exist: {cwd}")
+    admission_worktree_evidence = worktree_snapshot(cwd)
+    allowed_mutation_scope = (
+        "workspace-write" if contract["sandbox"] == "workspace-write" else "none"
+    )
+    _atomic_private_bytes(
+        run_dir / "input-manifest.json",
+        (json.dumps({
+            "schema_version": 1,
+            "plan_id": plan["plan_id"],
+            "phase_key": phase["phase_key"],
+            "dispatch_packet_sha256": packet["dispatch_packet_sha256"],
+            "phase_contract_sha256": packet["phase_contract_sha256"],
+            "prompt_sha256": packet["prompt_sha256"],
+            "source_commit": packet["source_commit"],
+        }, indent=2, sort_keys=True) + "\n").encode("utf-8"),
+    )
+    _atomic_private_bytes(run_dir / "prompt.txt", prompt.encode("utf-8"))
 
     started = time.time()
     returncode, stdout, stderr = client.run(
@@ -843,76 +1256,9 @@ def command_run(args: argparse.Namespace, *, CLI: type[ClaudeCLI] = ClaudeCLI) -
     _atomic_private_bytes(stream_path, stream_bytes)
     stream_sha256 = sha256_bytes(stream_bytes)
 
-    if returncode == DISPATCH_TIMEOUT_RETURNCODE:
-        cap = int(contract["wall_time_seconds"])
-        stream_event_count = 0
-        for _ln in stdout.splitlines():
-            if not _ln.strip():
-                continue
-            try:
-                json.loads(_ln)
-                stream_event_count += 1
-            except json.JSONDecodeError:
-                pass
-        receipt = append_registry_receipt(
-            "execution",
-            {
-                "runtime": RUNTIME_LABEL,
-                "evidence_source": EVIDENCE_SOURCE_STREAM,
-                "evidence_grade": EVIDENCE_GRADE,
-                "issued_at": utc_now(),
-                "run_id": run_id,
-                "plan_id": plan["plan_id"],
-                "phase_key": phase["phase_key"],
-                "workflow_id": resolution.get("workflow_id"),
-                "workflow_version": resolution.get("workflow_version"),
-                "phase_id": resolution.get("phase_id"),
-                "router_policy_id": plan.get("router_policy_id"),
-                "dispatch_packet_sha256": packet["dispatch_packet_sha256"],
-                "phase_contract_sha256": packet["phase_contract_sha256"],
-                "prompt_sha256": packet["prompt_sha256"],
-                "source_commit": packet["source_commit"],
-                "tier": tier,
-                "requested_model": resolution["model"],
-                "requested_effort": effort,
-                "execution_identity": "ABORTED_NO_RESUMABLE_CHECKPOINT",
-                "command": command,
-                "permission_mode": permission_mode,
-                "disallowed_tools": list(disallowed),
-                "allowed_tools": list(allowed),
-                "max_budget_usd": budget,
-                "sandbox": contract["sandbox"],
-                "tool_mode": contract["tool_mode"],
-                "network_access": bool(contract["network_access"]),
-                "mutation_authorized": bool(contract["mutation_authorized"]),
-                "stream_path": str(stream_path),
-                "stream_sha256": stream_sha256,
-                "stream_event_count": stream_event_count,
-                "elapsed_ms": elapsed_ms,
-                "status": "ABORTED_WALL_TIME",
-                "wall_time_seconds": cap,
-                "scored_evidence_status": "BLOCKED_MODEL_ENFORCEMENT",
-            },
-        )
-        raise DispatchError(
-            f"claude headless dispatch exceeded its {cap}s wall-time cap; "
-            f"partial stream retained at {stream_path}; "
-            f"aborted receipt {receipt['receipt_sha256'][:12]}"
-        )
-    if returncode != 0:
-        raise DispatchError(
-            "claude headless dispatch failed: " + (stderr.strip() or "unknown error")
-        )
-    events, terminal = parse_stream(stdout)
-    metadata = runtime_metadata(terminal)
-    if metadata["is_error"]:
-        raise DispatchError(
-            f"claude reported a terminal error result: {metadata.get('subtype')}"
-        )
-
-    receipt = append_registry_receipt(
-        "execution",
-        {
+    def terminal_payload(**extra: Any) -> dict[str, Any]:
+        """The common observed record for success and every terminal abort."""
+        return {
             "runtime": RUNTIME_LABEL,
             "evidence_source": EVIDENCE_SOURCE_STREAM,
             "evidence_grade": EVIDENCE_GRADE,
@@ -931,24 +1277,106 @@ def command_run(args: argparse.Namespace, *, CLI: type[ClaudeCLI] = ClaudeCLI) -
             "tier": tier,
             "requested_model": resolution["model"],
             "requested_effort": effort,
-            "observed_models": observed_models(metadata),
-            "execution_identity": resolution.get("execution_identity"),
             "command": command,
             "permission_mode": permission_mode,
             "disallowed_tools": list(disallowed),
             "allowed_tools": list(allowed),
             "max_budget_usd": budget,
+            "token_cap": token_cap,
             "sandbox": contract["sandbox"],
             "tool_mode": contract["tool_mode"],
             "network_access": bool(contract["network_access"]),
             "mutation_authorized": bool(contract["mutation_authorized"]),
             "stream_path": str(stream_path),
             "stream_sha256": stream_sha256,
-            "stream_event_count": len(events),
+            "stream_event_count": _stream_event_count(stdout),
             "elapsed_ms": elapsed_ms,
-            "runtime_metadata": metadata,
             "scored_evidence_status": "BLOCKED_MODEL_ENFORCEMENT",
-        },
+            **extra,
+        }
+
+    def abort(
+        *, category: str, issue: str, status: str = "ABORTED"
+    ) -> None:
+        receipt, directive = persist_terminal_control_return(
+            run_dir=run_dir,
+            cwd=cwd,
+            receipt_payload=terminal_payload(
+                status=status,
+                terminal_category=category,
+                terminal_issues=[issue],
+                execution_identity="ABORTED_NO_RESUMABLE_CHECKPOINT",
+            ),
+            terminal_status="ABORTED",
+            terminal_category=category,
+            issues=[issue],
+            phase_key=phase["phase_key"],
+            tier=tier,
+            admission_worktree_evidence=admission_worktree_evidence,
+            allowed_mutation_scope=allowed_mutation_scope,
+        )
+        raise DispatchError(
+            f"{issue}; terminal receipt {receipt['receipt_sha256'][:12]}; "
+            f"typed control return {directive['directive_sha256'][:12]} at "
+            f"{run_dir / 'control-return.json'}"
+        )
+
+    if returncode == DISPATCH_TIMEOUT_RETURNCODE:
+        cap = int(contract["wall_time_seconds"])
+        abort(
+            category="BUDGET_STOP",
+            status="ABORTED_WALL_TIME",
+            issue=(
+                f"claude headless dispatch exceeded its {cap}s wall-time cap; "
+                f"partial stream retained at {stream_path}"
+            ),
+        )
+    if returncode != 0:
+        abort(
+            category="TRANSIENT_FAILURE",
+            issue="claude headless dispatch failed: " + (stderr.strip() or "unknown error"),
+        )
+    try:
+        events, terminal = parse_stream(stdout)
+        metadata = runtime_metadata(terminal)
+        usage = observed_cumulative_tokens(metadata)
+    except DispatchError as error:
+        abort(category="MODEL_ENFORCEMENT_FAILURE", issue=str(error))
+    if metadata["is_error"]:
+        subtype = str(metadata.get("subtype") or "unknown")
+        budget_like = any(token in subtype.lower() for token in ("max", "token", "context", "limit"))
+        abort(
+            category="BUDGET_STOP" if budget_like else "MODEL_ENFORCEMENT_FAILURE",
+            issue=f"claude reported a terminal error result: {subtype}",
+        )
+    if usage["total_tokens"] > token_cap:
+        abort(
+            category="BUDGET_STOP",
+            issue=(
+                "claude observed cumulative usage exceeded effective token cap: "
+                f"{usage['total_tokens']} > {token_cap}"
+            ),
+        )
+
+    receipt, directive = persist_terminal_control_return(
+        run_dir=run_dir,
+        cwd=cwd,
+        receipt_payload=terminal_payload(
+            status="COMPLETED",
+            terminal_category=None,
+            terminal_issues=[],
+            observed_models=observed_models(metadata),
+            execution_identity=resolution.get("execution_identity"),
+            runtime_metadata=metadata,
+            observed_usage=usage,
+        ),
+        terminal_status="COMPLETED",
+        terminal_category=None,
+        issues=[],
+        phase_key=phase["phase_key"],
+        tier=tier,
+        admission_worktree_evidence=admission_worktree_evidence,
+        allowed_mutation_scope=allowed_mutation_scope,
     )
     return {
         "status": "COMPLETED",
@@ -964,6 +1392,9 @@ def command_run(args: argparse.Namespace, *, CLI: type[ClaudeCLI] = ClaudeCLI) -
         "total_cost_usd": metadata.get("total_cost_usd"),
         "dispatcher_receipt_sha256": receipt["receipt_sha256"],
         "receipt_sequence": receipt["sequence"],
+        "observed_usage": usage,
+        "control_return": directive,
+        "control_return_path": str(run_dir / "control-return.json"),
         "scored_evidence_status": "BLOCKED_MODEL_ENFORCEMENT",
     }
 
@@ -1088,6 +1519,21 @@ def command_skill_read(args: argparse.Namespace) -> dict[str, Any]:
     }
 
 
+def command_pivot_from_receipt(args: argparse.Namespace) -> dict[str, Any]:
+    _, _, directive = read_bound_json(args.receipt, "control-return receipt")
+    previous: dict[str, Any] | None = None
+    if args.output is not None:
+        output = args.output.expanduser().absolute()
+        if output.exists() or output.is_symlink() or not output.parent.is_dir():
+            raise DispatchError("pivot output must be a new safe file")
+    else:
+        output = None
+    pivot = pivot_from_receipt(directive, previous_pivot=previous)
+    if output is not None:
+        output.write_text(json.dumps(pivot, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    return pivot
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Dispatch one route-bound workflow phase to the Claude CLI."
@@ -1108,6 +1554,15 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--tool-mode", choices=("default", "none"), default="default")
     run.add_argument("--mutation-authorized", action="store_true")
     run.add_argument("--wall-time-seconds", type=int, required=True)
+    run.add_argument("--token-cap", type=int)
+    run.add_argument("--token-cap-contract", type=Path)
+
+    pivot = commands.add_parser(
+        "pivot-from-receipt",
+        help="Derive the deterministic no-dispatch recovery action from a terminal receipt",
+    )
+    pivot.add_argument("--receipt", type=Path, required=True)
+    pivot.add_argument("--output", type=Path)
 
     capacity = commands.add_parser(
         "capacity-plan", help="Derive a governed parallelism contract"
@@ -1148,6 +1603,8 @@ def main(argv: list[str] | None = None) -> int:
             result: dict[str, Any] = command_check()
         elif args.command == "run":
             result = command_run(args)
+        elif args.command == "pivot-from-receipt":
+            result = command_pivot_from_receipt(args)
         elif args.command == "capacity-plan":
             result = command_capacity_plan(args)
         elif args.command == "open-tree":

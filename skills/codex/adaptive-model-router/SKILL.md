@@ -1,11 +1,32 @@
 ---
 name: adaptive-model-router
-description: Route Codex work to the smallest proven OpenAI coding model and reasoning tier for each phase, continuously discover newly available Codex models, and reoptimize routing through paired evals, measured outcomes, promotion gates, and exact rollback. Use when coordinating multi-agent work, choosing models or reasoning effort, controlling cost or latency, assigning planning and implementation, polling CI or PRs, handling release operations, evaluating a new coding model, or checking whether the current model policy remains optimal.
+description: Route harness-eligible Codex work to the smallest proven OpenAI coding model and reasoning tier for each phase, with measured promotion and exact rollback. Use when the user explicitly requests adaptive routing or work needs model or effort selection, dependent multi-agent coordination, multiple material phases, resumption or recurrence, cross-system coordination or judgment, consequential action, or evidence-heavy adjudication. Do not use for low-risk work clearly bounded to the current turn when one agent—or only a small independent read-only fan-out—can complete it without cross-system coordination or judgment.
 ---
 
 # Adaptive Model Router
 
 Spend reasoning on the phases that need it. Keep model selection adaptive, evidence-backed, and reversible.
+
+## Activation boundary
+
+- Keep work direct only when it is low-risk and clearly bounded to the current
+  turn, needs no cross-system coordination or judgment, and either one agent
+  can finish it or a small fan-out is limited to independent, bounded read-only
+  scans or reviews. A short inspection, local edit, focused test, exact status
+  read, or mechanical PR creation from prepared inputs can remain direct.
+- Activate this harness when the user explicitly requests it or when work is
+  materially multi-phase, needs dependent multi-agent coordination, is
+  long-running or resumable, is recurring or monitored, needs cross-system
+  coordination or judgment, is consequential or high-risk, or depends on
+  evidence-heavy/conflict-bearing judgment.
+- Risk overrides apparent simplicity. Merge or deploy decisions and actions,
+  destructive operations, security or authorization judgments or changes,
+  billing changes, and schema or data migrations always activate the harness,
+  even when the immediate command is short.
+- Once activated, all routing, dispatch, evidence, budget, and authority rules
+  in this skill and `adaptive-workflow-router` are mandatory. Direct work is
+  outside T0-T4 and creates no harness plan, receipt, governance ledger entry,
+  or adaptive-routing claim.
 
 ## Operating contract
 
@@ -19,8 +40,8 @@ Spend reasoning on the phases that need it. Keep model selection adaptive, evide
 - Restrict automatic routing to locally available OpenAI models. Never substitute Anthropic or another provider.
 - Treat Daybreak only as an explicitly staged, evaluation-only T3 security candidate. Never discover, stage, select, fall back to, promote, or describe it as an automatic general-purpose route.
 - Enforce a non-regressing current-family rule: derive the newest visible OpenAI text family from the canonical live normalized router catalog and combine it with the active policy's no-downgrade family window. A caller declaration, profile, prompt, or substitute catalog cannot select the family. Every model-bearing route, fallback, and scored harness arm must use that family. Compare variants and reasoning efforts only within it. A catalog disappearance never moves the family backward; fail visibly instead of downgrading. T0 remains model-free.
-- Within the current family, prefer Luna/low for T1, Terra/medium for T2, Terra/high for T3, and Sol/ultra for T4. Sol/ultra is a hard active-route requirement for T4; if it is unavailable, fail visibly instead of assigning a weaker variant.
-- T4 is a read-only strategic lane. A phase that directly mutates state may be planned or adjudicated at T4, but its separately bound execution route is capped at the highest write-capable lane, T3.
+- Within the current family, use the active policy's qualified role/effort assignment for each tier. T4's qualified deepest-effort route is a hard requirement; if it is unavailable, fail visibly instead of assigning a weaker variant.
+- T4 is a read-only strategic lane. A phase that directly mutates state may be planned or adjudicated at T4, but its separately bound execution route is capped at the highest write-capable lane, T3. A T4 response is direction only: it cannot contain a patch, mutation grant, deployment instruction, or external-action authorization. Every `grounded_cognitive_failure` selects `t4_consult` when immutable evidence is complete and non-contradictory: offline, no tools, read-only, one model cycle, and the packet's strict cap. Incomplete or contradictory evidence selects `t4_diagnose`: exact repository/path scope, network disabled, strict token/tool/model-cycle/wall caps, and bounded read-only tools only. Any resulting mutation must re-enter through a newly planned and bound T3-or-lower route. Its fresh T3 packet must consume and revalidate an `adaptive-workflow.t4-direction-to-t3-mutation` contract bound to the T4 pivot, evidence bundle, source commit, repository/path, phase, and limits.
 - Size token budgets from the phase requirements and measured runner context, not from one universal workflow ceiling. Keep identical explicit caps for paired experiment arms, but derive each case cap from its manifest.
 - Require a quality-preserving top-tier counterfactual before qualifying a T1-T3 candidate. The counterfactual uses an evaluation-only copy of the candidate tier's exact role template, tools, and permissions while changing only provider/model/effort to the active T4 route. It never becomes an active profile and T4 candidates are exempt because T4 is the reference.
 - Treat ordinary ungraded workflow telemetry as operational telemetry only. It cannot satisfy incumbent/challenger or top-tier model-evidence gates, even when its observed route and usage are valid.
@@ -29,7 +50,7 @@ Spend reasoning on the phases that need it. Keep model selection adaptive, evide
 
 ## Load the active route
 
-Run `python3 scripts/router_lab.py status` before a model-routing or multi-agent decision. Run `python3 scripts/router_lab.py refresh --stage-new` when the catalog baseline is absent or stale.
+After activation, run `python3 scripts/router_lab.py status` before the first adaptive model-routing or dispatch decision. Run `python3 scripts/router_lab.py refresh --stage-new` when the catalog baseline is absent or stale. Do not load router state merely to classify direct work.
 
 Use the four active assignments returned by the lab:
 
@@ -43,7 +64,7 @@ Use the four active assignments returned by the lab:
 
 Require exact `ultra` support for a new T4 challenger. A text-only coding model may serve T1 only when the phase has no image or visual-inspection requirement; keep it out of T2-T4.
 
-The active tier mapping is role policy, not an experiment suggestion: T1 minimizes tokens with Luna/low, T2-T3 use Terra for execution and difficult solving, and T4 reserves Sol/ultra for the highest-consequence strategic work. Same-family experiments may compare alternatives, but promotion may not violate a hard active-variant requirement.
+The active tier mapping is role policy, not an experiment suggestion: use the policy-rendered assignment and required effort for each tier. Same-family experiments may compare alternatives, but promotion may not violate an active-variant requirement.
 
 ## Route the work
 
@@ -52,7 +73,7 @@ The active tier mapping is role policy, not an experiment suggestion: T1 minimiz
 3. Assign the smallest tier that can satisfy the phase.
 4. Raise the tier to meet the risk floor.
 5. Delegate only bounded work with clear inputs, outputs, and stopping conditions. Pass minimum useful context.
-6. Reassess after evidence. De-escalate when ambiguity resolves; escalate after a grounded cognitive failure.
+6. Reassess after evidence. De-escalate when ambiguity resolves; escalate after a grounded cognitive failure. Consume the workflow dispatcher's validated typed pivot rather than inferring recovery from logs.
 
 For application workflows, let `adaptive-workflow-router` own phase order, dependencies, artifacts, and completion gates. Keep this skill as the sole authority for tiers, models, effort, escalation, promotion, and rollback. Resolve a machine-readable phase request with:
 
@@ -63,14 +84,14 @@ cat REQUEST.json | router_lab.py resolve-phase --request -
 
 The response binds the route to the active policy and profile hash. `REQUESTED_PENDING_SERVER_METADATA` means the route is selected but is not yet eligible evidence. Eligibility requires a completed first-party Codex App Server turn with matching observed model, effort, and service tier, thread and turn IDs, completed agent-message IDs, usage, a raw-transcript hash, and no reroute or safety-buffer event. The workflow dispatcher additionally issues a private hash-chained execution receipt for accepted turns; persistent workflow learning requires that receipt and a trusted quality receipt bound to the exact evaluated executions. These are observed first-party harness records, not provider-signed or cryptographic proof that the provider executed the requested model.
 
-For ordinary multi-phase work on this machine, execute the selected route through `../adaptive-workflow-router/scripts/workflow_dispatch.py`; run its `check` command before substantial dispatch. A planned phase also requires the exact prompt/context/runtime packet generated by `workflow_plan.py bind`; a selected route without that packet is not executable. The public generic-spawn interface does not expose enforceable model and effort selection, so it is inherited-model execution and must not stand in for T1-T4 routing. If the dispatcher reports a mismatch, reroute, safety buffering, missing evidence, or cap breach, surface the incident and stop that phase rather than falling back to the parent model.
+For activated work on this machine, execute the selected route through `../adaptive-workflow-router/scripts/workflow_dispatch.py`; run its `check` command before substantial dispatch. A planned phase also requires the exact prompt/context/runtime packet generated by `workflow_plan.py bind`; a selected route without that packet is not executable. The public generic-spawn interface does not expose enforceable model and effort selection, so it is inherited-model execution and must not stand in for T1-T4 routing. If the dispatcher reports a mismatch, reroute, safety buffering, missing evidence, or cap breach, surface the incident and stop that phase rather than falling back to the parent model.
 
 ## Apply risk floors
 
 - Require at least T2 for changes affecting runtime behavior, data shape, public interfaces, security posture, dependencies, or builds. Allow T1 for an exact reversible typo or formatter-only edit.
 - Require at least T3 for authentication, authorization, secrets, billing, security, destructive data changes, schema migrations, production deploys, merge decisions, or rollback design.
 - Apply sensitive-domain floors to causal interpretation, design, decisions, and mutations. Allow tightly scoped T1 evidence collection that exposes no secret values and makes no sensitive judgment.
-- Use T4 for read-only planning or adjudication when T3-level risk combines with substantial ambiguity, novelty, interacting systems, weak observability, or repeated grounded failures. Hand the resulting bounded mutation to T3.
+- Use T4 for read-only planning or adjudication when T3-level risk combines with substantial ambiguity, novelty, interacting systems, weak observability, or repeated grounded failures. Hand the resulting bounded mutation to a newly planned and bound T3 route; no T4 route may mutate.
 - Keep final authority for irreversible or externally visible actions with the parent agent.
 - Judge reasoning and consequence, not output length.
 
@@ -86,10 +107,14 @@ For ordinary multi-phase work on this machine, execute the selected route throug
 
 ## Escalate and recover
 
-- Retry a transient tool, network, or provider error at the same tier.
-- Escalate one tier after a reasoning miss, missed constraint, contradictory conclusion, or unverifiable plan.
-- Do not repeat the same failed cognitive prompt more than once at one tier.
-- Send conflicting lower-tier conclusions to T3; use T4 only for materially complex or high-risk conflicts.
+Run `workflow_dispatch.py pivot-from-receipt` on a validated terminal control-return. It is deterministic and idempotent: it produces the next route request or exact question packet, but cannot select a model directly, grant authority, mutate, or enlarge a budget.
+
+- Repair a `deterministic_setup_failure` at T0 and permit one corrected retry. A repeated identical failure is a harness incident returned to the parent, not a T4 consultation.
+- Retry a `transient_failure` once at the same route; a repeated transient failure is a blocker.
+- Every `grounded_cognitive_failure` selects bounded read-only T4 direction through this router: `t4_consult` for complete immutable evidence and `t4_diagnose` for incomplete or contradictory evidence. Never repeat an identical failed cognitive prompt at the same tier. An `exit_gate_failure` returns to the model router for reassessment under its ordinary risk floor.
+- Return `authority_required` as an exact user/parent question without dispatching another worker; authority never routes to T4.
+- Partition `budget_or_context_exhaustion` before considering architectural consultation; a pivot never authorizes a budget increase.
+- Return `harness_unavailable` as a bounded read-only break-glass consultation packet. Any mutation prompted by it must re-enter the governed graph as a fresh T3-or-lower plan.
 - De-escalate after the plan, invariant, or exact command is established.
 
 ## Reoptimize the policy

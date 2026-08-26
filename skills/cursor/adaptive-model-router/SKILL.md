@@ -1,6 +1,6 @@
 ---
 name: adaptive-model-router
-description: Route Cursor's own working-agent phases to the smallest proven model and reasoning tier for each phase, tracked through a curated live catalog. Use when coordinating multi-agent work, choosing models or reasoning effort, controlling cost or latency, assigning planning and implementation, polling CI or PRs, or checking whether the current tier assignment still resolves against the live Cursor model catalog.
+description: Route harness-eligible Cursor working-agent phases to the smallest proven model and reasoning tier. Use when the user explicitly requests adaptive routing or work needs model or effort selection, dependent multi-agent coordination, multiple material phases, resumption or recurrence, cross-system coordination or judgment, consequential action, or evidence-heavy adjudication. Do not use for low-risk work clearly bounded to the current turn when one agent—or only a small independent read-only fan-out—can complete it without cross-system coordination or judgment.
 ---
 
 # Adaptive Model Router (Cursor)
@@ -11,6 +11,27 @@ It shares the Codex reference's T0-T4 tier model and phase-routing heuristic,
 but is honestly scoped down to what Cursor's surfaces can actually verify:
 **no scored experiments, no promotion pipeline, no scripted headless
 dispatcher in pass 1.** See `references/self-improvement-protocol.md` for why.
+
+## Activation boundary
+
+- Keep work direct only when it is low-risk and clearly bounded to the current
+  turn, needs no cross-system coordination or judgment, and either one agent
+  can finish it or a small fan-out is limited to independent, bounded read-only
+  scans or reviews. A short inspection, local edit, focused test, exact status
+  read, or mechanical PR creation from prepared inputs can remain direct.
+- Activate this harness when the user explicitly requests it or when work is
+  materially multi-phase, needs dependent multi-agent coordination, is
+  long-running or resumable, is recurring or monitored, needs cross-system
+  coordination or judgment, is consequential or high-risk, or depends on
+  evidence-heavy/conflict-bearing judgment.
+- Risk overrides apparent simplicity. Merge or deploy decisions and actions,
+  destructive operations, security or authorization judgments or changes,
+  billing changes, and schema or data migrations always activate the harness,
+  even when the immediate command is short.
+- Once activated, all routing, dispatch, evidence, budget, and authority rules
+  in this skill and `adaptive-workflow-router` are mandatory. Direct work is
+  outside T0-T4 and creates no harness plan, receipt, governance ledger entry,
+  or adaptive-routing claim.
 
 ## Operating contract
 
@@ -34,7 +55,9 @@ dispatcher in pass 1.** See `references/self-improvement-protocol.md` for why.
 
 ## Load the active route
 
-Run `python3 scripts/router_lab.py status` before a model-routing decision.
+After activation, run `python3 scripts/router_lab.py status` before the first
+adaptive model-routing decision. Do not load router state merely to classify
+direct work.
 Run `python3 scripts/router_lab.py refresh` when the catalog is stale or
 absent (first run seeds `~/.cursor/adaptive-model-router/`, backing up any
 prior stub instead of clobbering it).
@@ -46,6 +69,20 @@ prior stub instead of clobbering it).
 | T2 standard worker | `standard_worker`, active policy model at `medium` | Contained implementation, ordinary tests, localized debugging, straightforward docs/review | Cross-system ambiguity or high-consequence judgment |
 | T3 high solver | `high_solver`, active policy model at `high` | Cross-file diagnosis, nuanced implementation, edge cases, difficult review, auth/release analysis | Passive waiting, repetitive polling |
 | T4 ultra planner | `ultra_planner`, active policy model at its deepest seeded effort | Hard architecture, novel multi-system planning, migrations, adversarial/security reasoning, adjudication | Direct mutation, routine coding, known execution steps |
+
+For every grounded cognitive failure, the shared pure T4 contract selects
+`t4_consult` only when its retained evidence packet is complete and internally
+consistent; its immutable precomputed bundle is offline/read-only,
+`tool_mode: none`, one model cycle, zero tool cycles, and strictly token- and
+wall-capped. It otherwise selects `t4_diagnose` when evidence is incomplete or
+contradictory; that mode is offline with repository-read-only filesystem and
+exact repository/path scope, only bounded read-only tools, no mutation tools,
+and strict tool-cycle, token, model-cycle, and wall-time caps. An authority
+blocker is `ask_user` immediately, never T4. T4 never authorizes or performs
+a mutation, deployment, external action, or other state change; its result is
+direction only, and an actual mutation must re-enter through a freshly planned
+and bound T3-or-lower packet that consumes and revalidates the direction
+contract.
 
 ## Route the work
 
@@ -79,10 +116,15 @@ tiers, models, and effort. `workflow_plan.py plan`/`bind` calls
 
 See `references/dispatch-contract.md` for the two documented dispatch
 surfaces (in-session Task tool; headless `cursor-agent -p --model <slug>`).
-There is no scripted dispatcher script in this skill in pass 1 — the contract
-itself is the interface. If the surface you use cannot honor the resolved
-model and effort exactly, treat the phase as inherited-model execution: do
-not claim adaptive routing occurred.
+There is no scripted dispatcher, terminal receipt store, or pivot CLI in this
+skill in pass 1. Planner packets are not runtime enforcement evidence. If the
+surface you use cannot honor the resolved model and effort exactly, treat the
+phase as inherited-model execution: do not claim adaptive routing occurred.
+Unsupported runtime repair, resumption, enforcement, or pivot requests fail
+closed rather than being inferred from the planner. This includes T4
+consultation/diagnosis: Cursor can resolve and plan the pure contract, but
+cannot claim it ran, enforced its no-tools/read-only boundary, or authorized a
+mutation without a dispatcher and retained runtime evidence.
 
 ## Reoptimize the catalog
 

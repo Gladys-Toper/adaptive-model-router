@@ -77,7 +77,9 @@ def run_plan(*arguments: str) -> dict:
     return json.loads(completed.stdout)
 
 
-def run_bind(*arguments: str, check: bool = True) -> subprocess.CompletedProcess[str]:
+def run_bind(
+    *arguments: str, check: bool = True, auto_cap_contract: bool = True
+) -> subprocess.CompletedProcess[str]:
     if "--cwd" in arguments:
         cwd = Path(arguments[arguments.index("--cwd") + 1])
         probe = subprocess.run(
@@ -94,6 +96,8 @@ def run_bind(*arguments: str, check: bool = True) -> subprocess.CompletedProcess
                     "-C",
                     str(cwd),
                     "-c",
+                    "commit.gpgsign=false",
+                    "-c",
                     "user.name=Harness Test",
                     "-c",
                     "user.email=harness-test@example.invalid",
@@ -104,6 +108,14 @@ def run_bind(*arguments: str, check: bool = True) -> subprocess.CompletedProcess
                 ],
                 check=True,
             )
+    if (
+        auto_cap_contract
+        and "--token-cap-contract" not in arguments
+        and "--token-cap-contract-output" not in arguments
+        and "--cwd" in arguments
+    ):
+        cwd = Path(arguments[arguments.index("--cwd") + 1])
+        arguments = (*arguments, "--token-cap-contract-output", str(cwd / "fixed-cap.json"))
     completed = subprocess.run(
         [sys.executable, str(PLANNER), "bind", *arguments],
         text=True,
@@ -309,20 +321,23 @@ def test_release_dry_run_is_read_only_even_when_routed_to_t4() -> None:
                 "60",
             ).stdout
         )
-        assert packet["runtime_contract"] == {
+        assert {
             "sandbox": "read-only",
             "network_access": False,
             "tool_mode": "none",
             "mutation_authorized": False,
             "wall_time_seconds": 60,
             "requested_budget_limits": {
-                "token_cap": None,
+                "token_cap": dry_run["token_budget"]["declared_token_cap"],
                 "model_cycle_cap": None,
                 "tool_cycle_cap": None,
             },
-            "token_cap_contract_sha256": None,
+            "declared_token_cap": dry_run["token_budget"]["declared_token_cap"],
+            "derived_token_cap": dry_run["token_budget"]["declared_token_cap"],
+            "effective_token_cap": dry_run["token_budget"]["declared_token_cap"],
+            "caller_requested_token_cap": None,
             "budget_increase_contract_sha256": None,
-        }
+        }.items() <= packet["runtime_contract"].items()
 
 
 def test_invalid_condition_fails_closed() -> None:
@@ -445,6 +460,7 @@ def test_dispatch_packet_binds_exact_phase_and_runtime_inputs() -> None:
             "exit_gate": routed["exit_gate"],
             "route_request": routed["route_request"],
             "route_resolution": routed["route_resolution"],
+            "token_budget": routed["token_budget"],
         }
         assert packet["phase_contract_sha256"] == WORKFLOW_PLAN.content_hash(
             phase_identity
@@ -469,26 +485,30 @@ def test_dispatch_packet_binds_exact_phase_and_runtime_inputs() -> None:
             packet["context_files"]
         )
         assert packet["cwd"] == str(cwd.resolve())
-        assert packet["runtime_contract"] == {
+        assert {
             "sandbox": "read-only",
             "network_access": False,
             "tool_mode": "none",
             "mutation_authorized": False,
             "wall_time_seconds": 73,
             "requested_budget_limits": {
-                "token_cap": None,
+                "token_cap": routed["token_budget"]["declared_token_cap"],
                 "model_cycle_cap": None,
                 "tool_cycle_cap": None,
             },
-            "token_cap_contract_sha256": None,
+            "declared_token_cap": routed["token_budget"]["declared_token_cap"],
+            "derived_token_cap": routed["token_budget"]["declared_token_cap"],
+            "effective_token_cap": routed["token_budget"]["declared_token_cap"],
+            "caller_requested_token_cap": None,
             "budget_increase_contract_sha256": None,
-        }
+        }.items() <= packet["runtime_contract"].items()
         packet_identity = dict(packet)
         packet_sha256 = packet_identity.pop("dispatch_packet_sha256")
         assert packet_sha256 == WORKFLOW_PLAN.content_hash(packet_identity)
 
 
-def test_resumable_packet_is_explicit_policy_bound_and_legacy_safe() -> None:
+def test_resumption_lane_is_refused_on_the_cursor_surface() -> None:
+    """Cursor has no retained checkpoint/restart protocol; fail closed."""
     plan = run_plan("--application", "coding", "--objective", "resume safely")
     phase = next(
         item
@@ -544,7 +564,7 @@ def test_resumable_packet_is_explicit_policy_bound_and_legacy_safe() -> None:
         )
         assert legacy["schema_version"] == 1
         assert "resume_contract" not in legacy
-        arguments = (
+        base_arguments = (
             "--plan",
             str(plan_path),
             "--phase-key",
@@ -559,6 +579,12 @@ def test_resumable_packet_is_explicit_policy_bound_and_legacy_safe() -> None:
             "none",
             "--wall-time-seconds",
             "10",
+        )
+        legacy = json.loads(run_bind(*base_arguments).stdout)
+        assert legacy["schema_version"] == 1
+        assert "resume_contract" not in legacy
+        refused = run_bind(
+            *base_arguments,
             "--resumable",
             "--work-manifest",
             str(manifest_path),
@@ -572,34 +598,12 @@ def test_resumable_packet_is_explicit_policy_bound_and_legacy_safe() -> None:
             "2",
             "--checkpoint-ttl-seconds",
             "3600",
+            check=False,
         )
-        packet = json.loads(run_bind(*arguments).stdout)
-        assert packet["schema_version"] == 2
-        contract = packet["resume_contract"]
-        assert contract["mode"] == "explicit_checkpoint_restart"
-        assert contract["max_continuations"] == 1
-        assert contract["mutation_class"] == "none"
-        assert contract["work_manifest"]["manifest_sha256"] == (
-            WORKFLOW_PLAN.content_hash(manifest_identity)
-        )
-        bare_contract = dict(contract)
-        supplied_contract_hash = bare_contract.pop("resume_contract_sha256")
-        assert supplied_contract_hash == WORKFLOW_PLAN.content_hash(bare_contract)
+        assert refused.returncode != 0
+        assert "ABORTED_NO_RESUMABLE_CHECKPOINT" in refused.stderr
         missing_authority = run_bind(
-            "--plan",
-            str(plan_path),
-            "--phase-key",
-            phase["phase_key"],
-            "--prompt-file",
-            str(prompt_path),
-            "--cwd",
-            str(root),
-            "--sandbox",
-            "read-only",
-            "--tool-mode",
-            "none",
-            "--wall-time-seconds",
-            "10",
+            *base_arguments,
             "--max-continuations",
             "1",
             check=False,
@@ -691,6 +695,62 @@ def test_dispatch_packet_rejects_inactive_and_unsafe_inputs() -> None:
         )
         assert unsafe_no_tools.returncode != 0
         assert "no-tools dispatch requires read-only" in unsafe_no_tools.stderr
+
+
+def test_structured_token_cap_contract_binds_and_rejects_tampering() -> None:
+    initial = run_plan("--application", "coding", "--objective", "cap binding")
+    routed = next(
+        item for item in initial["phases"]
+        if item.get("activation") == "active"
+        and item.get("route_resolution", {}).get("mode") == "model"
+    )
+    plan = run_plan(
+        "--application", "coding", "--objective", "cap binding",
+        "--phase-token-cap", f"{routed['phase_key']}=20000",
+    )
+    routed = phase(plan, routed["phase_key"])
+    assert routed["token_budget"] == {
+        "schema_version": 1,
+        "declared_token_cap": 20_000,
+        "declaration_source": "plan.phase-token-cap",
+    }
+    with tempfile.TemporaryDirectory(prefix="cursor-workflow-cap-") as temporary:
+        root = Path(temporary)
+        plan_path, prompt_path, contract_path = (
+            root / "plan.json", root / "prompt.txt", root / "cap.json"
+        )
+        plan_path.write_text(json.dumps(plan), encoding="utf-8")
+        prompt_path.write_text("Bound prompt.\n", encoding="utf-8")
+        common = (
+            "--plan", str(plan_path), "--phase-key", routed["phase_key"],
+            "--prompt-file", str(prompt_path), "--cwd", str(root),
+            "--sandbox", "read-only", "--tool-mode", "none",
+            "--wall-time-seconds", "60", "--token-cap", "15000",
+        )
+        missing = run_bind(*common, check=False, auto_cap_contract=False)
+        assert missing.returncode != 0
+        assert "requires --token-cap-contract-output or --token-cap-contract" in missing.stderr
+        packet = json.loads(run_bind(
+            *common, "--token-cap-contract-output", str(contract_path),
+            auto_cap_contract=False,
+        ).stdout)
+        runtime = packet["runtime_contract"]
+        assert (runtime["declared_token_cap"], runtime["derived_token_cap"],
+                runtime["effective_token_cap"]) == (20_000, 20_000, 15_000)
+        assert runtime["requested_budget_limits"]["token_cap"] == 15_000
+        assert contract_path.is_file()
+        rebound = run_bind(
+            *common, "--token-cap-contract", str(contract_path),
+            auto_cap_contract=False,
+        )
+        assert rebound.returncode == 0
+        prompt_path.write_text("Tampered prompt.\n", encoding="utf-8")
+        rejected = run_bind(
+            *common, "--token-cap-contract", str(contract_path), check=False,
+            auto_cap_contract=False,
+        )
+        assert rejected.returncode != 0
+        assert "fixed token-cap contract" in rejected.stderr
 
 
 def test_runtime_condition_activation_is_evidence_gated() -> None:
@@ -968,8 +1028,9 @@ if __name__ == "__main__":
         test_invalid_condition_fails_closed,
         test_legacy_external_verifier_contract_is_narrowly_compatible,
         test_dispatch_packet_binds_exact_phase_and_runtime_inputs,
-        test_resumable_packet_is_explicit_policy_bound_and_legacy_safe,
+        test_resumption_lane_is_refused_on_the_cursor_surface,
         test_dispatch_packet_rejects_inactive_and_unsafe_inputs,
+        test_structured_token_cap_contract_binds_and_rejects_tampering,
         test_runtime_condition_activation_is_evidence_gated,
         test_plan_authority_rejects_self_rehashed_catalog_drift,
         test_plan_authority_ignores_evaluation_only_router_health,

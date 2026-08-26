@@ -1,11 +1,31 @@
 ---
 name: adaptive-workflow-router
-description: Select, compose, and run evidence-gated application workflows for coding, research, planning, debugging, review, data analysis, writing, and operations while using adaptive-model-router as the exclusive authority for model and reasoning-tier selection. Use for multi-phase work, mixed application tasks, parallel research or review, PR preparation, long-running loops, consequential actions, or workflow and routing optimization. Do not use for a single direct answer or one exact command.
+description: Select, compose, and run evidence-gated application workflows while using adaptive-model-router as the exclusive model and reasoning-tier authority. Use when the user explicitly requests the harness or work is materially multi-phase, dependently multi-agent, long-running or resumable, recurring or monitored, needs cross-system coordination or judgment, consequential or high-risk, or evidence-heavy/conflict-bearing. Do not use for low-risk work clearly bounded to the current turn when one agent—or only a small independent read-only fan-out—can complete it without cross-system coordination or judgment.
 ---
 
 # Adaptive Workflow Router
 
 Use a deterministic application graph for known work and spend model reasoning only inside cognitive phases. Resolve every active cognitive phase through `adaptive-model-router`; never put a model, provider, tier, effort, or fallback in a workflow source.
+
+## Activation boundary
+
+- Keep work direct only when it is low-risk and clearly bounded to the current
+  turn, needs no cross-system coordination or judgment, and either one agent
+  can finish it or a small fan-out is limited to independent, bounded read-only
+  scans or reviews. A short inspection, local edit, focused test, exact status
+  read, or mechanical PR creation from prepared inputs can remain direct.
+- Activate this harness when the user explicitly requests it or when work is
+  materially multi-phase, needs dependent multi-agent coordination, is
+  long-running or resumable, is recurring or monitored, needs cross-system
+  coordination or judgment, is consequential or high-risk, or depends on
+  evidence-heavy/conflict-bearing judgment.
+- Risk overrides apparent simplicity. Merge or deploy decisions and actions,
+  destructive operations, security or authorization judgments or changes,
+  billing changes, and schema or data migrations always activate the harness,
+  even when the immediate command is short.
+- Once activated, all routing, dispatch, evidence, budget, and authority rules
+  are mandatory. Direct work is outside T0-T4 and creates no harness plan,
+  receipt, governance ledger entry, or adaptive-routing claim.
 
 ## Start here
 
@@ -52,7 +72,7 @@ Use `research` before `planning` when a decision depends on current external evi
 
 The planner emits phase dependencies, activation mode, artifacts, exit gates, route requests, active-policy bindings, and requested route identities. It does not execute tools or confer authority.
 
-Every T1-T3 phase must run through the headless `claude -p` dispatcher when this local harness is available. T4 (`fable`/`max`) is **not** headless-dispatchable — `claude --effort` accepts only `low|medium|high` — so a T4 phase fails closed as `T4_HEADLESS_UNSUPPORTED` and is dispatched in-session through the Agent/Workflow tool contract below, never silently downgraded to `high`:
+Once an adaptive workflow is active, every T1-T3 phase must run through the headless `claude -p` dispatcher when this local harness is available. T4 (`fable`/`max`) is **not** headless-dispatchable — `claude --effort` accepts only `low|medium|high` — so this dispatcher fails closed as `T4_HEADLESS_UNSUPPORTED`, never silently downgrading to `high`. The recovery pivot is explicit for every grounded cognitive failure: a complete, internally consistent immutable evidence bundle selects `t4_consult`; incomplete or contradictory evidence selects `t4_diagnose`; `authority_required` selects `ask_user` and never dispatches T4. This Claude CLI driver does not claim to enforce either T4 mode: an in-session runner must reject the packet unless it can enforce the mode's exact repository/path scope, read-only filesystem, disabled network, no mutation tools, and all bound limits. A T4 result is direction only; a mutation requires a freshly planned and bound T3-or-lower packet that consumes and revalidates that bounded direction contract.
 
 ```text
 python3 scripts/workflow_plan.py bind \
@@ -77,11 +97,11 @@ python3 scripts/workflow_dispatch.py run \
 
 Before dispatch, record a fresh `skill-read` receipt for every applicable skill and bind the resulting self-hashed required-skills contract with `workflow_plan.py bind --required-skills-file`. Dispatch re-reads every listed skill, checks its hash and bounded read age, and fails closed when a required skill is absent, changed, stale, or never read. Completed workflow receipts retain `required_skills`, `skill_hashes`, `source_commit`, `exit_gate`, `files_changed`, and `verification`.
 
-All execution belongs to the bounded governance ledger. There is no arbitrary global agent-count ceiling. The coordinator decomposes the task first into an exact branch DAG with route identity, dependencies, mutation scopes, model-specific cost/quota weights, and separate token, model-cycle, tool-cycle, and wall-time ceilings. `workflow_dispatch.py capacity-plan` ignores caller-authored capacity and the governance authority deterministically derives a time-bounded weighted snapshot from the installed execution policy and current host resources, then packs the branch DAG into conflict-free waves and self-hashes the result. Every branch's weights must exactly match the installed model policy. `open-tree` derives descendant tokens from that contract; callers cannot type an unbound fan-out count. At child admission, the locked ledger conserves active resource weight across all trees, so multiple valid plans cannot each consume the full envelope. Every child must use a verified workflow plan and exact planner packet, name one unused branch and coordinator lease, start in a clean task-bound worktree, and match the branch's route, packet hash, permissions, resource envelope, and exclusive hierarchical mutation scopes. Both committed and uncommitted writes outside those scopes, and any source-commit drift including an empty commit, block acceptance. A planned branch can reach `COMPLETED` only with its matching execution receipt in the harness's validated hash-chained registry; generic terminal calls cannot complete planned branches or coordinators. A later wave cannot start until every prior-wave branch completed with that evidence. `close-tree` cannot claim success with active, failed, or unfinished branches. `close-tree --status` accepts exactly `COMPLETED|ABORTED|BLOCKED` (uppercase, required); `EXPIRED` is reachable only by lease decay, never by request. Every terminal, expired, or stale lease emits an immediate receipt. Direct one-off dispatches get a one-child ephemeral tree, consume the conservative maximum model weight, and cannot spawn descendants.
+All execution inside an activated adaptive workflow belongs to the bounded governance ledger. There is no arbitrary global agent-count ceiling. The coordinator decomposes the task first into an exact branch DAG with route identity, dependencies, mutation scopes, model-specific cost/quota weights, and separate token, model-cycle, tool-cycle, and wall-time ceilings. `workflow_dispatch.py capacity-plan` ignores caller-authored capacity and the governance authority deterministically derives a time-bounded weighted snapshot from the installed execution policy and current host resources, then packs the branch DAG into conflict-free waves and self-hashes the result. Every branch's weights must exactly match the installed model policy. `open-tree` derives descendant tokens from that contract; callers cannot type an unbound fan-out count. At child admission, the locked ledger conserves active resource weight across all trees, so multiple valid plans cannot each consume the full envelope. Every child must use a verified workflow plan and exact planner packet, name one unused branch and coordinator lease, start in a clean task-bound worktree, and match the branch's route, packet hash, permissions, resource envelope, and exclusive hierarchical mutation scopes. Both committed and uncommitted writes outside those scopes, and any source-commit drift including an empty commit, block acceptance. A planned branch can reach `COMPLETED` only with its matching execution receipt in the harness's validated hash-chained registry; generic terminal calls cannot complete planned branches or coordinators. A later wave cannot start until every prior-wave branch completed with that evidence. `close-tree` cannot claim success with active, failed, or unfinished branches. `close-tree --status` accepts exactly `COMPLETED|ABORTED|BLOCKED` (uppercase, required); `EXPIRED` is reachable only by lease decay, never by request. Every terminal, expired, or stale lease emits an immediate receipt. Single-phase one-off harness dispatches get a one-child ephemeral tree, consume the conservative maximum model weight, and cannot spawn descendants.
 
 The operational sequence is `capacity-plan -> open-tree -> run each ready wave -> close-tree`. Run independent branches concurrently with ordinary process orchestration; do not hold a model turn open while waiting. Poll branch processes with T0, then dispatch a model only for terminal audit or failure diagnosis. A capacity contract may describe more than nine branches. Its finite count is derived from the actual task DAG, not a product-wide cap.
 
-Retain the `bind` command's JSON output as `PHASE.dispatch.json`; it cryptographically binds the selected planned phase to the exact prompt, one ordered precomputed context bundle, cwd, sandbox, network, tool mode, mutation authority, requested token/model-cycle/tool-cycle limits, budget-contract hashes, and wall-time contract. Dispatch rejects any changed input or permission. Prefer this planner-bound fixed bundle over model-led file discovery whenever the required evidence can be assembled deterministically.
+Retain the `bind` command's JSON output as `PHASE.dispatch.json`; it cryptographically binds the selected planned phase to the exact prompt, one ordered precomputed context bundle, cwd, sandbox, network, tool mode, mutation authority, requested token/model-cycle/tool-cycle limits, budget-contract hashes, and wall-time contract. Each model phase carries a structured `token_budget.declared_token_cap`; use `plan --phase-token-cap PHASE_KEY=CAP` to lower one explicitly and `bind --token-cap-contract-output PATH` to emit the coupled self-hashed fixed-cap/evidence pair. A headless model invocation requires that exact contract via `run --token-cap-contract PATH`; prose never authorizes a cap. Dispatch rejects any changed input, contract, or permission. Prefer this planner-bound fixed bundle over model-led file discovery whenever the required evidence can be assembled deterministically.
 
 **There is no resumption lane on the Claude surface.** The Claude CLI exposes
 `--resume`/`--session-id` but no analog of the App Server `turn/steer` +
@@ -134,10 +154,10 @@ For each ready phase:
 3. Give a worker only the declared objective, inputs, outputs, evidence standard, and exit gate.
 4. Fan out only independent work. Gather results through one synthesizing phase; do not let parallel workers mutate the same state.
 5. Record exact commands, source links, artifact paths, checks, uncertainty, and failures before advancing. A tool-enabled phase must observe the local `node_repl` bridge reach `ready` before its model turn starts; missing readiness fails closed without spending a model call.
-6. Treat `REQUESTED_PENDING_SERVER_METADATA` as a requested route, not proof of the model that ran. Only a completed dispatcher record and its registry receipt supply observed runtime identity. Ordinary dispatcher records are explicitly ineligible for model promotion; scored experiments must separately satisfy the router's grader/run/import contract. A scored workflow result additionally needs a registered quality receipt from the pinned deterministic grader or a receipt-bound independent blind grader; a caller-authored quality file is not evidence. These receipts are first-party observed harness provenance, not provider-signed proof. The legacy `REQUESTED_NOT_ATTESTED` identity remains valid only with its external-verifier contract.
-7. Stop when the exit gate passes. A transient tool or network error gets one same-route retry; a grounded cognitive failure returns to the model router for reassessment.
+6. Treat `REQUESTED_PENDING_RUNTIME_METADATA` as a requested route, not proof of the model that ran. Only a completed dispatcher record and its registry receipt supply observed runtime identity. Ordinary dispatcher records are explicitly ineligible for model promotion; scored experiments must separately satisfy the router's grader/run/import contract. A scored workflow result additionally needs a registered quality receipt from the pinned deterministic grader or a receipt-bound independent blind grader; a caller-authored quality file is not evidence. These receipts are first-party observed harness provenance, not provider-signed proof. The legacy `REQUESTED_NOT_ATTESTED` identity remains valid only with its external-verifier contract.
+7. Stop when the exit gate passes. A transient tool or network error gets one same-route retry. Every grounded cognitive failure pivots deterministically to `t4_consult` for complete, internally consistent evidence or `t4_diagnose` for incomplete or contradictory evidence; `authority_required` is `ask_user`, never T4.
 
-T0 is reserved for exact checks, bounded polling, and predefined deterministic execution. Source selection, interpretation, diagnosis, synthesis, approval, and risk decisions are cognitive phases even when their output is short.
+Within an activated adaptive workflow, T0 is reserved for exact checks, bounded polling, and predefined deterministic execution. Source selection, interpretation, diagnosis, synthesis, approval, and risk decisions are cognitive phases even when their output is short.
 
 ## Preserve authority boundaries
 
@@ -208,17 +228,23 @@ Two lanes exist and they are not interchangeable.
 * **Headless (`scripts/workflow_dispatch.py run`)** — T1-T3 only, evidence-bearing,
   receipts written. This is the lane for every phase whose effort is
   `low|medium|high`.
-* **In-session (Agent tool / Workflow tool)** — the only lane for T4
-  (`fable`/`max`) and for surfaces that inherit the caller's session. Dispatch
-  the phase with the router-resolved profile: `Agent(subagent_type:
-  "ultra-planner", model: "fable", effort: "max")`, or the Workflow tool with
-  the same explicit `model` and `effort`. The rendered profile in
-  `~/.claude/agents/<agent>.md` pins `model`/`effort` in its YAML frontmatter and
-  the T4 profile additionally pins `disallowedTools` so the strategic lane stays
-  read-only. In-session dispatch produces **no** execution receipt: its
-  execution identity stays `REQUESTED_PENDING_RUNTIME_METADATA` and it is never
-  model-promotion evidence. Record its outcome as ordinary workflow provenance
-  only.
+* **In-session (Agent tool / Workflow tool)** — a possible T4 lane only when
+  that runner enforces the canonical T4 packet. For every grounded cognitive
+  failure, complete and internally consistent evidence selects `t4_consult`:
+  its evidence bundle is immutable and precomputed, `tool_mode: none`, the
+  scope is offline/read-only, it has exactly one model cycle and zero tool
+  cycles, and it observes strict structured token and wall caps. Incomplete or
+  contradictory evidence selects `t4_diagnose`: it is offline with a
+  repository read-only filesystem, exact repository/path scope, no mutation
+  tools, only bounded read-only tools, and strict token, tool-cycle,
+  model-cycle, and wall-time caps. Neither mode may mutate. If the in-session
+  runner cannot prove those controls, it must reject the packet rather than
+  execute a weaker T4 route. `authority_required` is `ask_user`, not a T4
+  request. T4 output is direction only; a mutation requires a freshly planned
+  and bound T3-or-lower packet that consumes and revalidates the bounded
+  direction contract. In-session execution produces **no** execution receipt: its
+  identity stays `REQUESTED_PENDING_RUNTIME_METADATA` and it is never
+  model-promotion evidence; that requested identity is not proof of a runtime.
 
 Never satisfy a T4 phase by running the headless dispatcher at `high`. The
 refusal is deliberate: a silently weaker route would make the plan's own

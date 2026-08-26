@@ -67,7 +67,9 @@ def run_plan(*arguments: str) -> dict:
     return json.loads(completed.stdout)
 
 
-def run_bind(*arguments: str, check: bool = True) -> subprocess.CompletedProcess[str]:
+def run_bind(
+    *arguments: str, check: bool = True, auto_cap_contract: bool = True
+) -> subprocess.CompletedProcess[str]:
     if "--cwd" in arguments:
         cwd = Path(arguments[arguments.index("--cwd") + 1])
         probe = subprocess.run(
@@ -84,6 +86,8 @@ def run_bind(*arguments: str, check: bool = True) -> subprocess.CompletedProcess
                     "-C",
                     str(cwd),
                     "-c",
+                    "commit.gpgSign=false",
+                    "-c",
                     "user.name=Harness Test",
                     "-c",
                     "user.email=harness-test@example.invalid",
@@ -94,6 +98,14 @@ def run_bind(*arguments: str, check: bool = True) -> subprocess.CompletedProcess
                 ],
                 check=True,
             )
+    if (
+        auto_cap_contract
+        and "--token-cap-contract" not in arguments
+        and "--token-cap-contract-output" not in arguments
+        and "--cwd" in arguments
+    ):
+        cwd = Path(arguments[arguments.index("--cwd") + 1])
+        arguments = (*arguments, "--token-cap-contract-output", str(cwd / "fixed-cap.json"))
     completed = subprocess.run(
         [sys.executable, str(PLANNER), "bind", *arguments],
         text=True,
@@ -281,38 +293,15 @@ def test_release_dry_run_is_read_only_even_when_routed_to_t4() -> None:
         plan_path.write_text(json.dumps(plan), encoding="utf-8")
         prompt_path.write_text("Validate the bound release packet.\n", encoding="utf-8")
         cwd.mkdir()
-        packet = json.loads(
-            run_bind(
-                "--plan",
-                str(plan_path),
-                "--phase-key",
-                dry_run["phase_key"],
-                "--prompt-file",
-                str(prompt_path),
-                "--cwd",
-                str(cwd),
-                "--sandbox",
-                "read-only",
-                "--tool-mode",
-                "none",
-                "--wall-time-seconds",
-                "60",
-            ).stdout
+        completed = subprocess.run(
+            [
+                sys.executable, str(PLANNER), "bind", "--plan", str(plan_path),
+                "--phase-key", dry_run["phase_key"], "--prompt-file", str(prompt_path),
+                "--cwd", str(cwd), "--sandbox", "read-only", "--tool-mode", "none",
+                "--wall-time-seconds", "60",
+            ], text=True, capture_output=True, check=False,
         )
-        assert packet["runtime_contract"] == {
-            "sandbox": "read-only",
-            "network_access": False,
-            "tool_mode": "none",
-            "mutation_authorized": False,
-            "wall_time_seconds": 60,
-            "requested_budget_limits": {
-                "token_cap": None,
-                "model_cycle_cap": None,
-                "tool_cycle_cap": None,
-            },
-            "token_cap_contract_sha256": None,
-            "budget_increase_contract_sha256": None,
-        }
+        assert completed.returncode != 0
 
 
 def test_invalid_condition_fails_closed() -> None:
@@ -435,6 +424,7 @@ def test_dispatch_packet_binds_exact_phase_and_runtime_inputs() -> None:
             "exit_gate": routed["exit_gate"],
             "route_request": routed["route_request"],
             "route_resolution": routed["route_resolution"],
+            "token_budget": routed["token_budget"],
         }
         assert packet["phase_contract_sha256"] == WORKFLOW_PLAN.content_hash(
             phase_identity
@@ -459,20 +449,30 @@ def test_dispatch_packet_binds_exact_phase_and_runtime_inputs() -> None:
             packet["context_files"]
         )
         assert packet["cwd"] == str(cwd.resolve())
-        assert packet["runtime_contract"] == {
+        runtime = packet["runtime_contract"]
+        assert {
             "sandbox": "read-only",
             "network_access": False,
             "tool_mode": "none",
             "mutation_authorized": False,
+            "planner_authorized_mutation_scope": [],
             "wall_time_seconds": 73,
             "requested_budget_limits": {
-                "token_cap": None,
+                "token_cap": routed["token_budget"]["declared_token_cap"],
                 "model_cycle_cap": None,
                 "tool_cycle_cap": None,
             },
-            "token_cap_contract_sha256": None,
+            "declared_token_cap": routed["token_budget"]["declared_token_cap"],
+            "derived_token_cap": routed["token_budget"]["declared_token_cap"],
+            "effective_token_cap": routed["token_budget"]["declared_token_cap"],
+            "caller_requested_token_cap": None,
             "budget_increase_contract_sha256": None,
-        }
+        }.items() <= runtime.items()
+        assert all(len(runtime[key]) == 64 for key in (
+            "token_cap_contract_sha256",
+            "token_cap_task_binding_sha256",
+            "dispatch_packet_binding_sha256",
+        ))
         packet_identity = dict(packet)
         packet_sha256 = packet_identity.pop("dispatch_packet_sha256")
         assert packet_sha256 == WORKFLOW_PLAN.content_hash(packet_identity)
@@ -681,6 +681,244 @@ def test_dispatch_packet_rejects_inactive_and_unsafe_inputs() -> None:
         )
         assert unsafe_no_tools.returncode != 0
         assert "no-tools dispatch requires read-only" in unsafe_no_tools.stderr
+
+
+def test_planner_authorized_mutation_scope_is_exact_and_packet_bound() -> None:
+    plan = run_plan("--application", "coding", "--objective", "sealed mutation scope")
+    active = next(
+        item
+        for item in plan["phases"]
+        if item.get("activation") == "active"
+        and item.get("route_resolution", {}).get("mode") == "model"
+    )
+    with tempfile.TemporaryDirectory(prefix="workflow-mutation-scope-") as temporary:
+        root = Path(temporary)
+        cwd = root / "workspace"
+        target = cwd / "target"
+        nested = cwd / "nested"
+        plan_path = root / "plan.json"
+        prompt_path = root / "prompt.txt"
+        output_path = root / "packet.json"
+        cwd.mkdir()
+        target.mkdir()
+        nested.mkdir()
+        (cwd / "link").symlink_to(target, target_is_directory=True)
+        plan_path.write_text(json.dumps(plan), encoding="utf-8")
+        prompt_path.write_text("Mutate only the sealed target.\n", encoding="utf-8")
+
+        assert WORKFLOW_PLAN.normalize_planner_authorized_mutation_scope(
+            ["target", "nested"], cwd, mutation_authorized=True
+        ) == ["nested", "target"]
+        for values, authorized, expected in (
+            ([], True, "requires a nonempty"),
+            (["target"], False, "requires --mutation-authorized"),
+            (["."], True, "repository root"),
+            (["../outside"], True, "cannot traverse"),
+            (["missing"], True, "must exist"),
+            ([".git/config"], True, "cannot traverse .git"),
+            (["link"], True, "cannot contain a symlink"),
+            (["target", "target"], True, "must be unique"),
+        ):
+            try:
+                WORKFLOW_PLAN.normalize_planner_authorized_mutation_scope(
+                    values, cwd, mutation_authorized=authorized
+                )
+            except WORKFLOW_PLAN.WorkflowError as error:
+                assert expected in str(error)
+            else:
+                raise AssertionError(f"unsafe mutation scope was accepted: {values!r}")
+
+        common = (
+            "--plan", str(plan_path),
+            "--phase-key", active["phase_key"],
+            "--prompt-file", str(prompt_path),
+            "--cwd", str(cwd),
+            "--sandbox", "workspace-write",
+            "--tool-mode", "default",
+            "--mutation-authorized",
+            "--wall-time-seconds", "30",
+            "--output", str(output_path),
+        )
+        packet = json.loads(
+            run_bind(
+                *common,
+                "--planner-authorized-mutation-scope", "target",
+            ).stdout
+        )
+        assert packet["runtime_contract"]["planner_authorized_mutation_scope"] == ["target"]
+        other_packet = json.loads(
+            run_bind(
+                *common,
+                "--planner-authorized-mutation-scope", "nested",
+            ).stdout
+        )
+        assert (
+            packet["runtime_contract"]["dispatch_packet_binding_sha256"]
+            != other_packet["runtime_contract"]["dispatch_packet_binding_sha256"]
+        )
+        assert (
+            packet["runtime_contract"]["token_cap_task_binding_sha256"]
+            != other_packet["runtime_contract"]["token_cap_task_binding_sha256"]
+        )
+
+
+def test_structured_token_cap_contract_binds_and_rejects_tampering() -> None:
+    initial = run_plan("--application", "coding", "--objective", "cap binding")
+    initial_routed = next(
+        item
+        for item in initial["phases"]
+        if item.get("activation") == "active"
+        and item.get("route_resolution", {}).get("mode") == "model"
+    )
+    declared = 20_000
+    plan = run_plan(
+        "--application", "coding", "--objective", "cap binding",
+        "--phase-token-cap", f"{initial_routed['phase_key']}={declared}",
+    )
+    routed = phase(plan, initial_routed["phase_key"])
+    assert routed["token_budget"] == {
+        "schema_version": 1,
+        "declared_token_cap": declared,
+        "declaration_source": "plan.phase-token-cap",
+    }
+    with tempfile.TemporaryDirectory(prefix="workflow-token-cap-") as temporary:
+        root = Path(temporary)
+        plan_path = root / "plan.json"
+        prompt_path = root / "prompt.txt"
+        context_path = root / "context.txt"
+        contract_path = root / "cap.json"
+        plan_path.write_text(json.dumps(plan), encoding="utf-8")
+        prompt_path.write_text("Bound prompt.\n", encoding="utf-8")
+        context_path.write_text("Bound context.\n", encoding="utf-8")
+        common = (
+            "--plan", str(plan_path), "--phase-key", routed["phase_key"],
+            "--prompt-file", str(prompt_path), "--context-file", str(context_path),
+            "--cwd", str(root), "--sandbox", "read-only", "--tool-mode", "none",
+            "--wall-time-seconds", "60", "--token-cap", "15000",
+        )
+        missing = run_bind(*common, check=False, auto_cap_contract=False)
+        assert missing.returncode != 0
+        assert "requires --token-cap-contract-output or --token-cap-contract" in missing.stderr
+        packet = json.loads(
+            run_bind(
+                *common, "--token-cap-contract-output", str(contract_path),
+                auto_cap_contract=False,
+            ).stdout
+        )
+        runtime = packet["runtime_contract"]
+        assert runtime["declared_token_cap"] == declared
+        assert runtime["derived_token_cap"] == declared
+        assert runtime["effective_token_cap"] == 15_000
+        assert runtime["requested_budget_limits"]["token_cap"] == 15_000
+        assert runtime["caller_requested_token_cap"] == 15_000
+        assert runtime["token_cap_contract_sha256"] == hashlib.sha256(
+            contract_path.read_bytes()
+        ).hexdigest()
+        contract = json.loads(contract_path.read_text(encoding="utf-8"))
+        identity = dict(contract)
+        assert identity.pop("contract_sha256") == WORKFLOW_PLAN.content_hash(identity)
+        evidence_path = Path(contract["measured_safe_evidence_path"])
+        evidence = json.loads(evidence_path.read_text(encoding="utf-8"))
+        assert evidence["effective_token_cap"] == 15_000
+        assert evidence["caller_requested_token_cap"] == 15_000
+        assert evidence["task_binding"] == contract["task_binding"]
+        assert evidence["task_binding_sha256"] == contract["task_binding_sha256"]
+        assert contract["declared_token_cap"] == declared
+        assert contract["derived_token_cap"] == declared
+        assert contract["caller_requested_token_cap"] == 15_000
+        assert contract["effective_token_cap"] == 15_000
+        assert contract["task_binding_sha256"] == runtime["token_cap_task_binding_sha256"]
+        rebound = run_bind(
+            *common, "--token-cap-contract", str(contract_path), auto_cap_contract=False
+        )
+        assert rebound.returncode == 0
+        original_contract = copy.deepcopy(contract)
+        original_evidence = copy.deepcopy(evidence)
+
+        # Rehashing a cap artifact for a different prompt must not make it
+        # reusable for this packet. The complete task binding is compared by
+        # the shared validator, rather than trusting either self-hash.
+        unrelated_binding = copy.deepcopy(evidence["task_binding"])
+        unrelated_binding["prompt_sha256"] = "e" * 64
+        evidence["task_binding"] = unrelated_binding
+        evidence["task_binding_sha256"] = WORKFLOW_PLAN.content_hash(unrelated_binding)
+        evidence["evidence_sha256"] = WORKFLOW_PLAN.content_hash(
+            {key: value for key, value in evidence.items() if key != "evidence_sha256"}
+        )
+        evidence_raw = (json.dumps(evidence, indent=2, sort_keys=True) + "\n").encode("utf-8")
+        contract["task_binding"] = unrelated_binding
+        contract["task_binding_sha256"] = evidence["task_binding_sha256"]
+        contract["evidence_sha256"] = evidence["evidence_sha256"]
+        contract["measured_safe_evidence_sha256"] = hashlib.sha256(evidence_raw).hexdigest()
+        contract["contract_sha256"] = WORKFLOW_PLAN.content_hash(
+            {key: value for key, value in contract.items() if key != "contract_sha256"}
+        )
+        evidence_path.write_bytes(evidence_raw)
+        contract_path.write_text(json.dumps(contract), encoding="utf-8")
+        unrelated_rehashed = run_bind(
+            *common, "--token-cap-contract", str(contract_path), check=False,
+            auto_cap_contract=False,
+        )
+        assert unrelated_rehashed.returncode != 0
+        assert "fixed token-cap" in unrelated_rehashed.stderr
+
+        # A coherent self-rehash with a lower cap is still not authority for a
+        # packet whose requested/effective cap is 15,000.
+        contract = copy.deepcopy(original_contract)
+        evidence = copy.deepcopy(original_evidence)
+        for artifact in (contract, evidence):
+            artifact["caller_requested_token_cap"] = 14_999
+            artifact["effective_token_cap"] = 14_999
+            artifact["task_binding"]["runtime_cap_limits"]["caller_requested_token_cap"] = 14_999
+            artifact["task_binding"]["runtime_cap_limits"]["effective_token_cap"] = 14_999
+            artifact["task_binding_sha256"] = WORKFLOW_PLAN.content_hash(artifact["task_binding"])
+        evidence["evidence_sha256"] = WORKFLOW_PLAN.content_hash(
+            {key: value for key, value in evidence.items() if key != "evidence_sha256"}
+        )
+        evidence_raw = (json.dumps(evidence, indent=2, sort_keys=True) + "\n").encode("utf-8")
+        contract["token_cap"] = 14_999
+        contract["evidence_sha256"] = evidence["evidence_sha256"]
+        contract["measured_safe_evidence_sha256"] = hashlib.sha256(evidence_raw).hexdigest()
+        contract["contract_sha256"] = WORKFLOW_PLAN.content_hash(
+            {key: value for key, value in contract.items() if key != "contract_sha256"}
+        )
+        evidence_path.write_bytes(evidence_raw)
+        contract_path.write_text(json.dumps(contract), encoding="utf-8")
+        wrong_cap_rehashed = run_bind(
+            *common, "--token-cap-contract", str(contract_path), check=False,
+            auto_cap_contract=False,
+        )
+        assert wrong_cap_rehashed.returncode != 0
+        assert "fixed token-cap" in wrong_cap_rehashed.stderr
+
+        contract = original_contract
+        evidence_path.write_text(
+            json.dumps(original_evidence, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        contract_path.write_text(json.dumps(contract), encoding="utf-8")
+        prompt_path.write_text("Tampered prompt.\n", encoding="utf-8")
+        mismatched_prompt = run_bind(
+            *common, "--token-cap-contract", str(contract_path), check=False,
+            auto_cap_contract=False,
+        )
+        assert mismatched_prompt.returncode != 0
+        assert "fixed token-cap contract" in mismatched_prompt.stderr
+        prompt_path.write_text("Bound prompt.\n", encoding="utf-8")
+        contract["token_cap"] = 14_999
+        contract_path.write_text(json.dumps(contract), encoding="utf-8")
+        malformed = run_bind(
+            *common, "--token-cap-contract", str(contract_path), check=False,
+            auto_cap_contract=False,
+        )
+        assert malformed.returncode != 0
+        assert "fixed token-cap contract" in malformed.stderr
+
+    prose = run_plan(
+        "--application", "coding", "--objective", "do this with 20k maximum"
+    )
+    prose_phase = phase(prose, routed["phase_key"])
+    assert prose_phase["token_budget"]["declaration_source"] == "planner.route-default"
 
 
 def test_runtime_condition_activation_is_evidence_gated() -> None:
@@ -960,6 +1198,7 @@ if __name__ == "__main__":
         test_dispatch_packet_binds_exact_phase_and_runtime_inputs,
         test_resumable_packet_is_explicit_policy_bound_and_legacy_safe,
         test_dispatch_packet_rejects_inactive_and_unsafe_inputs,
+        test_structured_token_cap_contract_binds_and_rejects_tampering,
         test_runtime_condition_activation_is_evidence_gated,
         test_plan_authority_rejects_self_rehashed_catalog_drift,
         test_plan_authority_ignores_evaluation_only_router_health,
